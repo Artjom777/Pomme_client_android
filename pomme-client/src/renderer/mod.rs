@@ -32,7 +32,7 @@ use pipelines::blur::BlurPipeline;
 use pipelines::book_preview::BookPreviewPipeline;
 use pipelines::chunk::ChunkPipeline;
 use pipelines::clouds::CloudPipeline;
-use pipelines::entity_renderer::{EntityRenderInfo, EntityRenderer};
+use pipelines::entity_renderer::{ArmorRenderInfo, EntityRenderInfo, EntityRenderer};
 use pipelines::hand::HandPipeline;
 use pipelines::menu_overlay::{MenuElement, MenuOverlayPipeline};
 use pipelines::panorama::PanoramaPipeline;
@@ -68,11 +68,15 @@ pub enum RendererError {
     Font(String),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PlayerPreview {
     pub rect: [f32; 4],
     pub gui_scale: f32,
+    /// Vanilla inventory entity-render size (30 normal inventory, 20 creative
+    /// inventory tab).
+    pub model_scale: f32,
     pub cursor: (f32, f32),
+    pub armor: [Option<ArmorRenderInfo>; 4],
 }
 
 /// The enchanting table's 3D book box: where to draw it and the
@@ -201,8 +205,8 @@ impl Renderer {
         let FontSources {
             jar_assets_dir,
             asset_index,
+            packs,
             options: font_options,
-            ..
         } = font_sources;
         let size = window.inner_size();
 
@@ -405,6 +409,7 @@ impl Renderer {
             &ctx.allocator,
             jar_assets_dir,
             asset_index,
+            packs,
         );
 
         let block_entity_pipeline = BlockEntityPipeline::new(
@@ -1278,6 +1283,16 @@ impl Renderer {
             .rebind_atlas(&self.ctx.device, &self.atlas);
         self.particle_pipeline
             .rebind_atlas(&self.ctx.device, &self.atlas);
+        self.entity_renderer.reload_armor_assets(
+            &self.ctx.device,
+            self.ctx.graphics_queue,
+            self.ctx.command_pool,
+            &self.ctx.allocator,
+            &self.jar_assets_dir,
+            &self.asset_index,
+            packs,
+        );
+
         self.reload_fonts(packs, font_options);
 
         warm_item_meshes(
@@ -1981,7 +1996,8 @@ impl Renderer {
                     };
                     cmd.clear_attachments(&[clear_attachment], &[clear_rect]);
                     cmd.set_scissor(0, &[rect]);
-                    self.skin_preview.draw_in_box(cmd, frame, *p, sw, sh);
+                    self.skin_preview
+                        .draw_in_box(cmd, frame, p, sw, sh, &self.entity_renderer);
                     cmd.set_scissor(0, &[scissor]);
                 }
 
