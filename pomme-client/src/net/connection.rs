@@ -589,7 +589,7 @@ async fn config_sequence(
                 if let Some(tags) = dialog_tags(&p.tags) {
                     received_dialog_tags = Some(tags);
                 }
-                forward_block_tags(event_tx, &p.tags);
+                forward_tags(event_tx, &p.tags);
             }
             ClientboundConfigPacket::SelectKnownPacks(p) => {
                 // Vanilla `handleSelectKnownPacks`: claim the offered packs we
@@ -832,10 +832,8 @@ fn dialog_tags(
 
 /// Forwards the `minecraft:block` tags of an `update_tags` packet, if it has
 /// any.
-fn forward_block_tags(
-    event_tx: &Sender<NetworkEvent>,
-    tags: &azalea_protocol::common::tags::TagMap,
-) {
+fn forward_tags(event_tx: &Sender<NetworkEvent>, tags: &azalea_protocol::common::tags::TagMap) {
+    let _ = event_tx.try_send(NetworkEvent::ItemTags(super::recipe_wire::item_tags(tags)));
     let key: azalea_registry::identifier::Identifier = "minecraft:block".into();
     let Some(tags) = tags.0.get(&key) else {
         return;
@@ -1034,7 +1032,7 @@ async fn game_loop(
                         let _ = event_tx
                             .try_send(NetworkEvent::DialogRegistry(configured.dialogs.clone()));
                     }
-                    forward_block_tags(event_tx, &p.tags);
+                    forward_tags(event_tx, &p.tags);
                 }
                 if let ClientboundGamePacket::Login(login) = &mut packet {
                     inbound_chat.reset();

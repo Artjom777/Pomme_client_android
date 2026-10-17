@@ -10,6 +10,7 @@ pub mod connection;
 mod dialog;
 pub mod handler;
 pub mod known_packs;
+mod recipe_wire;
 pub mod resolve;
 pub mod sender;
 pub mod stream;
@@ -65,6 +66,7 @@ pub enum NetworkEvent {
     /// The `minecraft:dialog` registry with its tags, sent with `Registries`
     /// and again whenever a tag update replaces the dialog tags.
     DialogRegistry(Arc<crate::ui::server_dialog::DialogRegistry>),
+    ItemTags(crate::recipe::ItemTags),
     BlockTags {
         tags: Vec<(String, Vec<i32>)>,
     },
@@ -211,6 +213,16 @@ pub enum NetworkEvent {
         op: crate::ui::boss_bar::BossBarOp,
     },
     AdvancementsUpdate(Box<crate::ui::toast::AdvancementsUpdate>),
+    RecipeBookAdd {
+        entries: Vec<crate::recipe::RecipeBookAddEntry>,
+        replace: bool,
+    },
+    RecipeBookRemove {
+        ids: Vec<crate::recipe::RecipeDisplayId>,
+    },
+    RecipeBookSettings(crate::recipe::RecipeBookSettings),
+    RecipeData(crate::recipe::RecipeData),
+    GhostRecipe(Box<crate::recipe::GhostRecipe>),
     RecipeToastAdd {
         entries: Vec<crate::ui::toast::RecipeToastEntry>,
     },
