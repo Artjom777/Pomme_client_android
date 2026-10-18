@@ -1872,6 +1872,36 @@ pub(crate) fn set_creative_slot(
     slot_num: u16,
     item: azalea_inventory::ItemStack,
 ) -> bool {
+    if !send_creative_slot(game, connection, slot_num, item.clone()) {
+        return false;
+    }
+    // Optimistic local update; the server echoes via ContainerSetSlot.
+    game.player.inventory.set_slot(slot_num as usize, item);
+    true
+}
+
+/// Vanilla `MultiPlayerGameMode.handleCreativeModeItemDrop`: the creative
+/// screen drops a stack into the world through slot -1.
+pub(crate) fn drop_creative_item(
+    game: &mut GameState,
+    connection: &ConnectionHandle,
+    item: azalea_inventory::ItemStack,
+) -> bool {
+    let sent = send_creative_slot(game, connection, u16::MAX, item);
+    if sent {
+        game.player.drop_spam.increment();
+    }
+    sent
+}
+
+/// `ServerboundSetCreativeModeSlotPacket` for `slot_num`, only in creative;
+/// the slot is a short on the wire, so `u16::MAX` is vanilla's -1.
+fn send_creative_slot(
+    game: &GameState,
+    connection: &ConnectionHandle,
+    slot_num: u16,
+    item: azalea_inventory::ItemStack,
+) -> bool {
     use azalea_protocol::packets::game::s_set_creative_mode_slot::ServerboundSetCreativeModeSlot;
 
     if !crate::player::is_creative(game.player.game_mode) {
@@ -1882,11 +1912,9 @@ pub(crate) fn set_creative_slot(
         .send(ServerboundGamePacket::SetCreativeModeSlot(
             ServerboundSetCreativeModeSlot {
                 slot_num,
-                item_stack: item.clone(),
+                item_stack: item,
             },
         ));
-    // Optimistic local update; the server echoes via ContainerSetSlot.
-    game.player.inventory.set_slot(slot_num as usize, item);
     true
 }
 
@@ -3518,6 +3546,9 @@ pub fn update_game(
         let scroll_delta = core.input.consume_menu_scroll();
         // `typed`/`backspace` come from the frame's single drain up top; a
         // second drain here would always read empty.
+        // Vanilla's focused search box takes every key, the drop key included.
+        let drop = (!game.wants_text_input() && core.input.drop_key_just_pressed())
+            .then(|| core.input.ctrl_held());
         let action = crate::ui::creative_inventory::build_creative_inventory(
             &mut elements,
             &mut game.creative_state,
@@ -3532,6 +3563,8 @@ pub fn update_game(
             core.input.key_just_pressed(winit::keyboard::KeyCode::KeyT),
             core.input.hotbar_key_just_pressed(),
             core.input.key_just_pressed(winit::keyboard::KeyCode::KeyF),
+            drop,
+            game.player.drop_spam.can_drop(),
             &game.player.inventory,
             gs,
             game.advanced_item_tooltips,
@@ -3558,6 +3591,21 @@ pub fn update_game(
                 for (slot_num, item) in items {
                     set_creative_slot(game, connection, slot_num, item);
                 }
+            }
+            // TODO: vanilla's client `LivingEntity.drop` also starts the local
+            // arm swing; only the packet is sent here, as for the world drop.
+            crate::ui::creative_inventory::CreativeAction::DropItem(item) => {
+                drop_creative_item(game, connection, item);
+                crate::player::interaction::send_use_swing(&connection.packet_tx);
+            }
+            crate::ui::creative_inventory::CreativeAction::DropSlot {
+                slot,
+                dropped,
+                remaining,
+            } => {
+                set_creative_slot(game, connection, slot, remaining);
+                drop_creative_item(game, connection, dropped);
+                crate::player::interaction::send_use_swing(&connection.packet_tx);
             }
             crate::ui::creative_inventory::CreativeAction::None => {}
         }
