@@ -8,6 +8,14 @@ pub struct LaunchArgs {
     #[arg(long)]
     pub version: Option<String>,
 
+    /// Initial window width in logical pixels (windowed mode).
+    #[arg(long, default_value_t = 854, value_parser = clap::value_parser!(u32).range(1..))]
+    pub width: u32,
+
+    /// Initial window height in logical pixels (windowed mode).
+    #[arg(long, default_value_t = 480, value_parser = clap::value_parser!(u32).range(1..))]
+    pub height: u32,
+
     #[arg(long)]
     pub username: Option<String>,
 
@@ -98,6 +106,8 @@ impl LaunchArgs {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::LaunchArgs;
 
     #[test]
@@ -113,5 +123,18 @@ mod tests {
         );
         assert!(LaunchArgs::from_words("").unwrap().username.is_none());
         assert!(LaunchArgs::from_words("--no-such-flag").is_err());
+    }
+
+    #[test]
+    fn window_size_defaults_each_side_to_vanilla() {
+        for (argv, size) in [
+            (&[][..], (854, 480)),
+            (&["--width", "1280", "--height", "720"], (1280, 720)),
+            (&["--width", "1280"], (1280, 480)),
+            (&["--height", "720"], (854, 720)),
+        ] {
+            let args = LaunchArgs::try_parse_from(["pomme"].iter().chain(argv)).unwrap();
+            assert_eq!((args.width, args.height), size, "{argv:?}");
+        }
     }
 }
