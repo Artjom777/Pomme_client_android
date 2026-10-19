@@ -50,6 +50,13 @@ use crate::user::UserData;
 fn main() {
     let args = args::LaunchArgs::parse();
 
+    // Ahead of logging, which writes into the folders this moves.
+    if args.owns_data_folder()
+        && let Err(e) = pomme_dirs::migrate()
+    {
+        eprintln!("Couldn't move the old .pomme folder: {e}");
+    }
+
     // Ahead of the launch-token guard, which bench builds have no launcher for.
     #[cfg(feature = "cpu-bench")]
     if let Some(filter) = &args.cpu_bench {
