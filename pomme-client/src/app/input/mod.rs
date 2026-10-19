@@ -8,9 +8,10 @@ use std::collections::{HashMap, HashSet};
 
 use gilrs::ff::{BaseEffect, Effect, EffectBuilder, Repeat, Replay};
 use gilrs::{Button, GamepadId, Gilrs};
-use winit::event::{ElementState, Modifiers, MouseButton};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::event::{ElementState, KeyEvent, Modifiers, MouseButton, Touch};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
+use self::touch::{TouchControls, TouchLayout, TouchOutput};
 use crate::app::TICK_RATE_MS;
 use crate::app::phases::AppPhase;
 use crate::app::state_slot::StateSlot;
@@ -20,6 +21,7 @@ pub mod action;
 pub mod input_key;
 pub mod key_bindings;
 mod metadata;
+pub mod touch;
 
 pub use action::Action;
 pub use input_key::InputKey;
@@ -146,6 +148,7 @@ pub struct InputState {
     harness_press: Option<(KeyCode, bool)>,
     mouse_delta: (f64, f64),
     cursor_captured: bool,
+    touch: TouchControls,
     selected_slot: u8,
     left_click: ClickState,
     right_click: ClickState,
@@ -195,6 +198,13 @@ pub struct InputState {
     strong_rumble_effect: Option<Effect>,
     active_gamepad_id: Option<GamepadId>,
     recent_actions: HashMap<Action, bool>,
+    /// Touch taps' releases, held back until the presses have been read.
+    tap_releases: Vec<TapRelease>,
+}
+
+enum TapRelease {
+    Mouse(MouseButton),
+    Key(KeyCode),
 }
 
 #[derive(Default)]
@@ -253,6 +263,7 @@ impl InputState {
             harness_press: None,
             mouse_delta: (0.0, 0.0),
             cursor_captured: true,
+            touch: TouchControls::default(),
             selected_slot: 0,
             left_click: ClickState::default(),
             right_click: ClickState::default(),
@@ -285,6 +296,7 @@ impl InputState {
             strong_rumble_effect: strong_effect,
             active_gamepad_id: None,
             recent_actions: HashMap::new(),
+            tap_releases: Vec::new(),
         }
     }
 
@@ -296,6 +308,10 @@ impl InputState {
         for event in &events {
             self.on_gamepad_event(event);
         }
+        let held = self
+            .touch
+            .tick(std::time::Instant::now(), phase.get().world_has_pointer());
+        self.apply_touch(held);
 
         if self.binding_capture {
             return false;
@@ -568,7 +584,9 @@ impl InputState {
     pub fn performing_action(&self, action: Action) -> bool {
         match action {
             Action::Jump => {
-                self.default_key_pressed(action) || self.gamepad_button_down(Button::South)
+                self.default_key_pressed(action)
+                    || self.gamepad_button_down(Button::South)
+                    || self.touch.jump_held()
             }
             Action::Sneak => {
                 self.default_key_pressed(action) || self.gamepad_button_down(Button::LeftThumb)
@@ -630,6 +648,14 @@ impl InputState {
         self.middle_click.just_pressed = false;
         self.middle_click.just_released = false;
         self.cursor_moved = false;
+
+        // A release in the same pass as its press would overwrite it.
+        for release in std::mem::take(&mut self.tap_releases) {
+            match release {
+                TapRelease::Mouse(button) => self.on_mouse_button(button, ElementState::Released),
+                TapRelease::Key(key) => self.on_key(key, ElementState::Released, false),
+            }
+        }
     }
 
     fn gamepad_stick(&self, x_axis: gilrs::Axis, y_axis: gilrs::Axis) -> Option<glam::Vec2> {
@@ -649,8 +675,12 @@ impl InputState {
         self.gamepad_stick(gilrs::Axis::LeftStickX, gilrs::Axis::LeftStickY)
     }
 
-    pub fn get_gamepad_movement_axes(&self) -> Option<glam::Vec2> {
-        self.get_gamepad_left_analog().map(gamepad_movement_axes)
+    /// The touch stick's or gamepad left stick's movement, touch first.
+    pub fn analog_movement_axes(&self) -> Option<glam::Vec2> {
+        self.touch
+            .stick()
+            .or_else(|| self.get_gamepad_left_analog())
+            .map(gamepad_movement_axes)
     }
 
     pub fn get_gamepad_right_analog(&self) -> Option<glam::Vec2> {
@@ -740,8 +770,8 @@ impl InputState {
             .map_or(Ok(()), Effect::play)
     }
 
-    pub fn on_key_event(&mut self, event: &winit::event::KeyEvent) {
-        if let PhysicalKey::Code(code) = event.physical_key {
+    pub fn on_key_event(&mut self, event: &KeyEvent) {
+        if let Some(code) = key_code(event) {
             self.on_key(code, event.state, event.repeat);
         }
     }
@@ -772,13 +802,7 @@ impl InputState {
                     && !self.menu_capture
                     && let Some(slot) = hotbar_slot(code)
                 {
-                    // Vanilla handleKeybinds: spectator digits drive the
-                    // spectator menu and never touch the carried slot.
-                    if self.spectator {
-                        self.spectator_slot_presses.push(slot);
-                    } else {
-                        self.selected_slot = slot;
-                    }
+                    self.select_hotbar(slot);
                 }
                 match code {
                     KeyCode::KeyE if !self.text_capture => {
@@ -840,9 +864,8 @@ impl InputState {
         }
     }
 
-    pub fn captures_key_event(&self, event: &winit::event::KeyEvent) -> bool {
-        matches!(event.physical_key, PhysicalKey::Code(code) if self.captures_key(code))
-            || self.binding_capture
+    pub fn captures_key_event(&self, event: &KeyEvent) -> bool {
+        key_code(event).is_some_and(|code| self.captures_key(code)) || self.binding_capture
     }
 
     fn captures_key(&self, code: KeyCode) -> bool {
@@ -880,7 +903,7 @@ impl InputState {
         // The ordered event stream for caret-editing text fields. Chars are
         // suppressed while the edit modifier is held, like GLFW's char
         // callback for Ctrl (Cmd) chords.
-        if let PhysicalKey::Code(code) = event.physical_key {
+        if let Some(code) = key_code(event) {
             self.text_events
                 .push(crate::ui::text_edit::TextInputEvent::Key {
                     code,
@@ -900,7 +923,7 @@ impl InputState {
             }
         }
 
-        if let PhysicalKey::Code(code) = event.physical_key {
+        if let Some(code) = key_code(event) {
             match code {
                 KeyCode::Enter | KeyCode::NumpadEnter => self.enter_pressed = true,
                 KeyCode::Escape => self.escape_pressed = true,
@@ -1012,6 +1035,67 @@ impl InputState {
         }
     }
 
+    /// `gameplay`: the world has the input (no screen, chat or pause menu).
+    pub fn on_touch(&mut self, touch: &Touch, gameplay: bool, layout: &TouchLayout) {
+        let p = glam::vec2(touch.location.x as f32, touch.location.y as f32);
+        let out = self.touch.on_touch(
+            touch.id,
+            touch.phase,
+            p,
+            gameplay,
+            layout,
+            std::time::Instant::now(),
+        );
+        self.apply_touch(out);
+    }
+
+    /// Vanilla `handleKeybinds`: in spectator a hotbar slot drives the
+    /// spectator menu and never touches the carried slot.
+    fn select_hotbar(&mut self, slot: u8) {
+        if self.spectator {
+            self.spectator_slot_presses.push(slot);
+        } else {
+            self.selected_slot = slot;
+        }
+    }
+
+    pub fn touch(&self) -> &TouchControls {
+        &self.touch
+    }
+
+    /// Plays touch gestures through the mouse and key paths, so everything
+    /// downstream treats them as clicks, drags and key presses.
+    fn apply_touch(&mut self, out: Vec<TouchOutput>) {
+        for output in out {
+            match output {
+                TouchOutput::Look(delta) => self.on_mouse_motion((delta.x.into(), delta.y.into())),
+                TouchOutput::DestroyStart | TouchOutput::PointerDown => {
+                    self.on_mouse_button(MouseButton::Left, ElementState::Pressed);
+                }
+                TouchOutput::DestroyEnd | TouchOutput::PointerUp => {
+                    self.on_mouse_button(MouseButton::Left, ElementState::Released);
+                }
+                TouchOutput::DestroyCancel => {
+                    self.left_click.held = false;
+                    self.recent_actions.remove(&Action::Destroy);
+                }
+                TouchOutput::Use => {
+                    self.on_mouse_button(MouseButton::Right, ElementState::Pressed);
+                    self.tap_releases
+                        .push(TapRelease::Mouse(MouseButton::Right));
+                }
+                TouchOutput::Tap(action) => {
+                    if let Some(key) = action.default_key() {
+                        self.on_key(key, ElementState::Pressed, false);
+                        self.tap_releases.push(TapRelease::Key(key));
+                    }
+                }
+                TouchOutput::Hotbar(slot) => self.select_hotbar(slot),
+                TouchOutput::PointerMove(p) => self.on_cursor_moved(p.x, p.y),
+            }
+        }
+    }
+
     pub fn on_mouse_motion(&mut self, delta: (f64, f64)) {
         self.mouse_delta.0 += delta.0;
         self.mouse_delta.1 += delta.1;
@@ -1113,6 +1197,20 @@ impl InputState {
     }
 }
 
+/// The key's code, with Android's Back as Escape: it arrives with no physical
+/// code, and closes screens and chat as Escape does.
+pub fn key_code(event: &KeyEvent) -> Option<KeyCode> {
+    key_code_of(&event.physical_key, &event.logical_key)
+}
+
+fn key_code_of(physical: &PhysicalKey, logical: &Key) -> Option<KeyCode> {
+    match (physical, logical) {
+        (PhysicalKey::Code(code), _) => Some(*code),
+        (_, Key::Named(NamedKey::BrowserBack)) => Some(KeyCode::Escape),
+        _ => None,
+    }
+}
+
 fn hotbar_slot(code: KeyCode) -> Option<u8> {
     match code {
         KeyCode::Digit1 => Some(0),
@@ -1168,6 +1266,17 @@ mod binding_capture_tests {
     use super::*;
 
     #[test]
+    fn a_use_tap_is_seen_before_it_releases() {
+        let mut input = InputState::released();
+        input.apply_touch(vec![TouchOutput::Use]);
+        assert!(input.action_just_pressed(Action::Use));
+        assert!(input.right_held());
+
+        input.clear_just_pressed_actions();
+        assert!(!input.right_held());
+    }
+
+    #[test]
     fn keyboard_capture_suppresses_repeats_until_release() {
         let mut input = InputState::released();
         input.set_binding_capture(true);
@@ -1211,5 +1320,32 @@ mod binding_capture_tests {
         assert!(input.take_binding_presses().is_empty());
         input.on_mouse_button(MouseButton::Left, ElementState::Pressed);
         assert!(input.left_just_pressed());
+    }
+}
+
+#[cfg(test)]
+mod key_code_tests {
+    use winit::keyboard::{Key, KeyCode, NamedKey, NativeKey, NativeKeyCode, PhysicalKey};
+
+    use super::key_code_of;
+
+    #[test]
+    fn android_back_is_escape() {
+        let unidentified = PhysicalKey::Unidentified(NativeKeyCode::Android(4));
+        assert_eq!(
+            key_code_of(
+                &PhysicalKey::Code(KeyCode::KeyT),
+                &Key::Character("t".into())
+            ),
+            Some(KeyCode::KeyT)
+        );
+        assert_eq!(
+            key_code_of(&unidentified, &Key::Named(NamedKey::BrowserBack)),
+            Some(KeyCode::Escape)
+        );
+        assert_eq!(
+            key_code_of(&unidentified, &Key::Unidentified(NativeKey::Android(4))),
+            None
+        );
     }
 }

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "pomme-android",
+    "pomme-auth",
+    "pomme-install",
     "pomme-client",
     "pomme-launcher/src-tauri",
     "pomme-gpu-allocator",

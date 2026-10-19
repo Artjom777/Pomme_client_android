@@ -27,7 +27,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha1_smol = { workspace = true }
-open = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
@@ -38,7 +37,7 @@ regex = { workspace = true }
 zip = { workspace = true }
 tokio = { workspace = true, features = ["tracing", "net", "time"] }
 reqwest = { workspace = true, features = ["blocking"] }
-pyronyx = { workspace = true, features = ["rwh_06"] }
+pyronyx = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
@@ -50,6 +49,7 @@ mimalloc = "0.1"
 pomme-gpu-allocator = { path = "../pomme-gpu-allocator" }
 pomme-dirs = { path = "../pomme-dirs" }
 pomme-protocol = { path = "../pomme-protocol" }
+pomme-install = { path = "../pomme-install" }
 pomme-singleplayer = { path = "../pomme-singleplayer", optional = true }
 winit = { version = "0.30", features = ["rwh_06"] }
 raw-window-handle = "0.6"
@@ -81,11 +81,25 @@ image = "0.25"
 fontdue = "0.9.3"
 freetype-rs = { version = "0.38", optional = true }
 simdnbt = "0.10"
-discord-rich-presence = "1.1"
-arboard = { version = "3", features = ["wayland-data-control"] }
 scopeguard = "1.2"
 libloading = "0.9"
+open = { workspace = true }
+discord-rich-presence = "1.1"
 criterion = { version = "=0.5.1", default-features = false, optional = true }
 symphonia = { version = "0.5.5", default-features = false, features = ["ogg", "vorbis"] }
 fastrand = "2"
 gilrs = "0.11.2"
+
+# arboard has no Android backend; pyronyx's window-handle helpers don't
+# compile there (see `renderer::context::window_surface`); Android has no OS
+# credential store for pomme-auth (see `account::store`).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+pomme-auth = { path = "../pomme-auth", features = ["keyring"] }
+pyronyx = { workspace = true, features = ["rwh_06"] }
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+pomme-auth = { path = "../pomme-auth" }
+jni = "0.21"
+winit = { version = "0.30", features = ["android-native-activity"] }
+paranoid-android = "0.2"

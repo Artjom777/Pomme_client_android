@@ -552,6 +552,15 @@ impl GameState {
         self.server_dialog.is_some() || self.chat.has_pending_modal_prompt()
     }
 
+    /// The world, not a screen, chat or the pause menu, takes pointer input.
+    pub fn world_has_pointer(&self) -> bool {
+        !self.paused
+            && !self.dead
+            && !self.death_screen_open
+            && !self.gui_open()
+            && !self.chat.is_open()
+    }
+
     pub fn gui_open(&self) -> bool {
         self.inventory_open
             || self.creative_inventory_open
@@ -1527,9 +1536,7 @@ fn handle_chat_ui_action(
             let Ok(url) = crate::chat_component::parse_untrusted_url(url) else {
                 return;
             };
-            if let Err(e) = open::that(&url) {
-                tracing::warn!("Could not open chat link {url:?}: {e}");
-            }
+            crate::util::open_url(&url);
         }
         ChatUiAction::OpenChatSettings => {
             game.chat.close_for_settings();
@@ -2786,6 +2793,18 @@ pub fn update_game(
             &attack,
             &|t, s| gfx.renderer.menu_text_width(t, s),
         );
+        if core.input.touch().seen() && game.world_has_pointer() {
+            let layout = input::touch::TouchLayout {
+                width: sw,
+                height: sh,
+                gs,
+            };
+            crate::ui::touch_controls::build_touch_controls(
+                &mut elements,
+                &layout,
+                core.input.touch(),
+            );
+        }
     }
 
     // Vanilla Hud.extractSleepOverlay sits outside the isHidden gate: above
@@ -4137,7 +4156,7 @@ pub fn update_game(
             core.apply_cursor_grab(&gfx.window, Some(game));
         }
         PauseAction::ReportBugs => {
-            let _ = open::that("https://github.com/PommeMC/Client/issues");
+            crate::util::open_url("https://github.com/PommeMC/Client/issues");
         }
         PauseAction::None => {}
     }

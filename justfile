@@ -25,9 +25,12 @@ client-dev *args: openal
     @cargo run -p pomme-client {{ args }}
 
 # Optimized release client for accurate benchmarking (supplies the launch token the guard needs).
+# Plays offline as Steve unless given account flags, so it never asks to sign in.
 client-release *args: openal
     #!/usr/bin/env bash
-    cargo run --release -p pomme-client -- --launch-token "$(mktemp)" {{ args }}
+    account=(--username Steve)
+    case " {{ args }} " in *" --username"* | *" --uuid"* | *" --access-token"*) account=() ;; esac
+    cargo run --release -p pomme-client -- --launch-token "$(mktemp)" "${account[@]}" {{ args }}
 
 # Headless CPU benchmarks (mesher, fade rebuild, occlusion), no window or GPU.
 # An optional filter runs only matching benches, e.g. `just bench mesh`.
@@ -45,6 +48,42 @@ ingame-test *scripts: openal
 # Just the local test server, for driving a client over the harness socket.
 ingame-server:
     @cargo run -p ingame-test -- --server-only
+
+# Android (pomme-android/README.md): the arm64 debug APK.
+android_app := "com.pommemc.client"
+
+android-build:
+    @python3 tools/build_openal_android.py pomme-android/app/src/main/jniLibs/arm64-v8a
+    @cargo ndk -t arm64-v8a -o pomme-android/app/src/main/jniLibs build -p pomme-android
+    @cd pomme-android && ./gradlew -q assembleDebug
+
+android-install: android-build
+    @adb install -r pomme-android/app/build/outputs/apk/debug/app-debug.apk
+
+android-run:
+    @adb shell am start -n {{ android_app }}/android.app.NativeActivity
+
+# Copies a desktop install's `minecraft/` assets and version files into the
+# app's own storage, through a staging dir `run-as` can read.
+android-push-assets src=(home_directory() / "Library/Application Support/Pomme/minecraft"):
+    #!/usr/bin/env bash
+    set -e
+    stage=/data/local/tmp/pomme
+    adb shell rm -rf "$stage" && adb shell mkdir -p "$stage/versions"
+    adb push "{{ src }}/assets" "$stage/"
+    adb push "{{ src }}/versions/26.2" "$stage/versions/"
+    adb shell run-as {{ android_app }} sh -c "'mkdir -p files/minecraft && cp -r $stage/. files/minecraft/'"
+    adb shell rm -rf "$stage"
+
+# The launch arguments, as on a command line, e.g.
+# `just android-config --version 26.2 --username Tester --quick-access-multiplayer 10.0.2.2:25565`.
+android-config *args:
+    #!/usr/bin/env bash
+    set -e
+    echo "{{ args }}" | adb shell run-as {{ android_app }} sh -c "'mkdir -p files && cat > files/launch.txt'"
+
+android-log:
+    @adb logcat -s pomme:V RustStdoutStderr:V AndroidRuntime:E DEBUG:V
 
 # TODO: CI also runs the client's clippy and tests with --no-default-features; mirror it here.
 

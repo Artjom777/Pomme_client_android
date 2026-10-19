@@ -1,5 +1,6 @@
 pub mod core;
 pub mod input;
+mod install;
 pub mod level_load;
 pub mod phases;
 pub mod state_slot;
@@ -12,18 +13,19 @@ use thiserror::Error;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::KeyCode;
 use winit::window::{Window, WindowId};
 
 use crate::app::core::AppCore;
+use crate::app::input::touch::TouchLayout;
 use crate::app::phases::connecting::{ConnectingUpdateResult, update_connecting};
 use crate::app::phases::in_game::{GameState, GameUpdateResult, update_game};
-use crate::app::phases::in_menu::{MenuUpdateResult, connect_args, open_world, update_menu};
+use crate::app::phases::in_menu::{self, MenuUpdateResult, update_menu};
 use crate::app::phases::saving::update_saving;
 use crate::app::phases::{AfterSaving, AppPhase, ConnectionPhase, FpsCounter, Gfx, Panorama};
 use crate::app::state_slot::StateSlot;
 use crate::dirs::DataDirs;
-use crate::net::connection::{ConnectArgs, ConnectionHandle, Transport, spawn_connection};
+use crate::net::connection::{ConnectArgs, ConnectionHandle, spawn_connection};
 use crate::renderer::{self, Renderer};
 use crate::singleplayer::World;
 use crate::user::UserData;
@@ -49,7 +51,16 @@ pub struct App {
     phase: StateSlot<AppPhase>,
     core: AppCore,
     occluded: bool,
+    /// In the background on Android; the loop sleeps instead of polling.
+    suspended: bool,
     fps_limiter: FramerateLimiter,
+    /// The version's assets are still downloading; startup waits for them.
+    install: Option<install::Install>,
+    /// The download screen's window, for the normal startup to keep.
+    installed_window: Option<Arc<Window>>,
+    /// Whether Android's soft keyboard was last asked for.
+    #[cfg(target_os = "android")]
+    soft_keyboard: bool,
     #[cfg(feature = "test-harness")]
     harness: Option<crate::harness::Harness>,
 }
@@ -193,17 +204,33 @@ impl App {
         user: UserData,
         quick_play: Option<QuickPlay>,
     ) -> Self {
+        let installed = data_dirs.is_installed(&version);
+        let pending_skin_uuid = user.has_profile.then_some(user.uuid);
+        let core = AppCore::new(version, data_dirs, tokio_rt, presence, user);
         Self {
             phase: StateSlot::new(AppPhase::Setup {
                 quick_play,
-                pending_skin_uuid: user.has_profile.then_some(user.uuid),
+                pending_skin_uuid,
             }),
-            core: AppCore::new(version, data_dirs, tokio_rt, presence, user),
+            install: (!installed).then(|| install::Install::start(&core)),
+            installed_window: None,
+            core,
             occluded: false,
+            suspended: true,
+            #[cfg(target_os = "android")]
+            soft_keyboard: false,
             fps_limiter: FramerateLimiter::new(),
             #[cfg(feature = "test-harness")]
             harness: None,
         }
+    }
+
+    /// No launcher passed an account; see `MainMenu::require_account`.
+    /// Holds the menu, and any quick play, until an account is signed in,
+    /// restoring the stored one in the background meanwhile.
+    pub fn require_account(&mut self) {
+        self.core.menu.require_account();
+        self.core.menu.restore_account();
     }
 
     #[cfg(feature = "test-harness")]
@@ -222,10 +249,23 @@ impl App {
         self.harness.as_ref()?.exit_code()
     }
 
-    pub fn run(&mut self) -> Result<(), WindowError> {
-        let event_loop = EventLoop::new()?;
+    pub fn run(&mut self, event_loop: EventLoop<()>) -> Result<(), WindowError> {
         event_loop.run_app(self)?;
         Ok(())
+    }
+
+    /// A text field has keyboard focus: chat and the in-game fields, or a
+    /// menu form's.
+    #[cfg(target_os = "android")]
+    fn wants_text_input(&self) -> bool {
+        match self.phase.get() {
+            AppPhase::InGame { game, .. } if !game.paused => self.core.input.text_capture,
+            _ => self.core.menu.text_field_focused(),
+        }
+    }
+
+    fn world_has_pointer(&self) -> bool {
+        self.phase.get().world_has_pointer()
     }
 
     /// The effective framerate cap, or `None` for uncapped, matching vanilla
@@ -243,41 +283,73 @@ impl App {
     }
 }
 
+/// The game window, born in the persisted display mode: the swapchain is
+/// sized from `inner_size()` before the window is shown, so switching after
+/// creation would leave it built for the windowed size.
+fn create_window(
+    event_loop: &ActiveEventLoop,
+    display_mode: crate::app::core::DisplayMode,
+) -> Result<Arc<Window>, winit::error::OsError> {
+    let window_icon = {
+        let img =
+            image::load_from_memory(crate::assets::POMME_ICON_PNG).expect("failed to decode icon");
+        let rgba = img.to_rgba8();
+        let (w, h) = (rgba.width(), rgba.height());
+        winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+    };
+    let monitor = event_loop
+        .primary_monitor()
+        .or_else(|| event_loop.available_monitors().next());
+    let window_attrs = Window::default_attributes()
+        .with_title("Pomme")
+        .with_inner_size(winit::dpi::LogicalSize::new(854, 480))
+        .with_fullscreen(display_mode.fullscreen_for(monitor))
+        .with_visible(false)
+        .with_window_icon(window_icon);
+    event_loop.create_window(window_attrs).map(Arc::new)
+}
+
 impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // Minecraft.exitWorldAndClose runs screen().removed() before close().
         self.core.menu.flush_settings();
     }
 
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.suspended = true;
+        if let Some(install) = &mut self.install {
+            install.suspend();
+        }
+        if let Some(gfx) = self.phase.gfx_mut() {
+            gfx.renderer.suspend();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.suspended = false;
+        if let Some(install) = &mut self.install {
+            install.resume(event_loop, &self.core);
+            return;
+        }
+        if let Some(gfx) = self.phase.gfx_mut() {
+            if let Err(e) = gfx.renderer.resume(&gfx.window) {
+                tracing::error!("Failed to resume the renderer: {e}");
+                event_loop.exit();
+            }
+            return;
+        }
         self.phase.transition(|app| match app {
             AppPhase::Setup {
                 quick_play,
                 mut pending_skin_uuid,
             } => {
-                let window_icon = {
-                    let img = image::load_from_memory(crate::assets::POMME_ICON_PNG)
-                        .expect("failed to decode icon");
-                    let rgba = img.to_rgba8();
-                    let (w, h) = (rgba.width(), rgba.height());
-                    winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
-                };
-
-                // Born in the persisted mode: the swapchain is sized from
-                // `inner_size()` before the window is shown, so switching after
-                // creation would leave it built for the windowed size.
-                let monitor = event_loop
-                    .primary_monitor()
-                    .or_else(|| event_loop.available_monitors().next());
-                let window_attrs = Window::default_attributes()
-                    .with_title("Pomme")
-                    .with_inner_size(winit::dpi::LogicalSize::new(854, 480))
-                    .with_fullscreen(self.core.display_mode.fullscreen_for(monitor))
-                    .with_visible(false)
-                    .with_window_icon(window_icon);
-
-                let window = match event_loop.create_window(window_attrs) {
-                    Ok(w) => Arc::new(w),
+                // The first-run download's window, if it ran.
+                let window = match self
+                    .installed_window
+                    .take()
+                    .map_or_else(|| create_window(event_loop, self.core.display_mode), Ok)
+                {
+                    Ok(w) => w,
                     Err(e) => {
                         tracing::error!("Failed to create window: {e}");
                         event_loop.exit();
@@ -290,12 +362,7 @@ impl ApplicationHandler for App {
 
                 let mut renderer = match Renderer::new(
                     Arc::clone(&window),
-                    crate::ui::font::FontSources {
-                        jar_assets_dir: &self.core.data_dirs.jar_assets_dir,
-                        asset_index: &self.core.asset_index,
-                        packs: &self.core.resource_packs,
-                        options: self.core.menu.font_options(),
-                    },
+                    self.core.font_sources(),
                     &self.core.data_dirs.game_dir,
                     &self.core.data_dirs.cache_dir,
                     self.core.menu.vsync,
@@ -330,20 +397,11 @@ impl ApplicationHandler for App {
                 };
                 let panorama = Panorama::new();
                 let launch = match quick_play {
-                    Some(QuickPlay::Multiplayer(server)) => MenuUpdateResult::Connect {
-                        // TODO: read the saved server list's protocol for
-                        // this address to skip the join-time probe.
-                        connect_args: connect_args(
-                            &self.core,
-                            Transport::Remote {
-                                server,
-                                protocol: None,
-                            },
-                            self.core.user.username.clone(),
-                        ),
-                        world: None,
-                    },
-                    Some(QuickPlay::Singleplayer(folder)) => open_world(&mut self.core, &folder),
+                    Some(play) if self.core.menu.account_gated() => {
+                        self.core.deferred_quick_play = Some(play);
+                        MenuUpdateResult::None
+                    }
+                    Some(play) => in_menu::quick_play(&mut self.core, play),
                     None => MenuUpdateResult::None,
                 };
                 match launch {
@@ -364,6 +422,39 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let Some(install) = &mut self.install {
+            match event {
+                WindowEvent::RedrawRequested => {
+                    if let install::Step::Done(window) = install.frame(&self.core.version) {
+                        self.install = None;
+                        self.core.reload_installed_assets();
+                        self.installed_window = Some(window);
+                        // In the background there's no surface to build the
+                        // renderer on; the real `resumed` builds it.
+                        if !self.suspended {
+                            self.resumed(event_loop);
+                            // The first frame of the normal loop, which asks
+                            // for each next one itself.
+                            if let Some(gfx) = self.phase.gfx_mut() {
+                                gfx.window.request_redraw();
+                            }
+                        }
+                    }
+                }
+                WindowEvent::Resized(size) => install.resize(size.width, size.height),
+                WindowEvent::MouseInput {
+                    state: winit::event::ElementState::Pressed,
+                    ..
+                }
+                | WindowEvent::Touch(winit::event::Touch {
+                    phase: winit::event::TouchPhase::Started,
+                    ..
+                }) => install.retry(&self.core),
+                WindowEvent::CloseRequested => event_loop.exit(),
+                _ => {}
+            }
+            return;
+        }
         let binding_capture = self.core.menu.binding_capture_active()
             && self.core.unfocused_since.is_none()
             && match self.phase.get() {
@@ -431,6 +522,7 @@ impl ApplicationHandler for App {
             }
             // TODO: Migrate _fully_ to Action system
             WindowEvent::KeyboardInput { event, .. } => {
+                let key = input::key_code(&event);
                 self.phase.transition(|mut app| {
                     if self.core.input.captures_key_event(&event) {
                         self.core.input.on_key_event(&event);
@@ -442,7 +534,7 @@ impl ApplicationHandler for App {
                         && event.state.is_pressed()
                         && !event.repeat
                         && !self.core.input.key_pressed(KeyCode::F3)
-                        && let PhysicalKey::Code(KeyCode::F11) = event.physical_key
+                        && key == Some(KeyCode::F11)
                     {
                         let display_mode = self.core.display_mode.cycle();
                         self.core.menu.set_display_mode(display_mode);
@@ -454,7 +546,7 @@ impl ApplicationHandler for App {
                         && event.state.is_pressed()
                         && !event.repeat
                         && !self.core.input.key_pressed(KeyCode::F3)
-                        && let PhysicalKey::Code(KeyCode::F2) = event.physical_key
+                        && key == Some(KeyCode::F2)
                     {
                         renderer.request_screenshot();
                     }
@@ -478,7 +570,7 @@ impl ApplicationHandler for App {
                             // A configuration-phase dialog replaces the
                             // connect screen and takes its keys.
                             if event.state.is_pressed()
-                                && let PhysicalKey::Code(code) = event.physical_key
+                                && let Some(code) = key
                                 && game.dialog_open()
                             {
                                 crate::app::phases::in_game::server_dialog_key(
@@ -497,9 +589,7 @@ impl ApplicationHandler for App {
                                     game,
                                     world,
                                 }
-                            } else if event.state.is_pressed()
-                                && let PhysicalKey::Code(KeyCode::Escape) = event.physical_key
-                            {
+                            } else if event.state.is_pressed() && key == Some(KeyCode::Escape) {
                                 leave_world(
                                     &mut self.core,
                                     gfx,
@@ -528,7 +618,7 @@ impl ApplicationHandler for App {
                             // No repeat filter: vanilla dispatches GLFW repeats
                             // to screens and debug chords alike.
                             if event.state.is_pressed()
-                                && let PhysicalKey::Code(code) = event.physical_key
+                                && let Some(code) = key
                             {
                                 if game.options_from_game {
                                     let f3_held = self.core.input.key_pressed(KeyCode::F3);
@@ -626,9 +716,7 @@ impl ApplicationHandler for App {
                                         }
                                     }
                                 }
-                            } else if !event.state.is_pressed()
-                                && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F3))
-                            {
+                            } else if !event.state.is_pressed() && key == Some(KeyCode::F3) {
                                 // Overlay toggles on F3 release, unless a chord
                                 // consumed it; runs in every in-game sub-state.
                                 game.handle_f3_release(&connection);
@@ -695,6 +783,20 @@ impl ApplicationHandler for App {
                         self.core.input.on_scroll(scroll)
                     }
                     _ => {}
+                }
+            }
+            // Desktop touchscreens already drive the mouse through the OS.
+            WindowEvent::Touch(touch) if cfg!(target_os = "android") => {
+                let gameplay = self.world_has_pointer();
+                if let Some(gfx) = self.phase.gfx_mut() {
+                    let width = gfx.renderer.screen_width() as f32;
+                    let height = gfx.renderer.screen_height() as f32;
+                    let layout = TouchLayout {
+                        width,
+                        height,
+                        gs: self.core.menu.gui_scale(width, height),
+                    };
+                    self.core.input.on_touch(&touch, gameplay, &layout);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -937,6 +1039,19 @@ impl ApplicationHandler for App {
 
                 core.input.end_frame();
 
+                // Desktop is left alone: allowing IME there moves typing from
+                // key events to IME events.
+                #[cfg(target_os = "android")]
+                {
+                    let wanted = self.wants_text_input();
+                    if wanted != self.soft_keyboard
+                        && let Some(gfx) = self.phase.gfx_mut()
+                    {
+                        gfx.window.set_ime_allowed(wanted);
+                        self.soft_keyboard = wanted;
+                    }
+                }
+
                 let limit = self.effective_framerate_limit();
                 if let Some(gfx) = self.phase.gfx_mut() {
                     if !gfx.window.is_visible().unwrap_or(true) {
@@ -962,13 +1077,17 @@ impl ApplicationHandler for App {
     ) {
         if let DeviceEvent::MouseMotion { delta } = event
             && self.core.input.is_cursor_captured()
-            && matches!(self.phase.get(), AppPhase::InGame { game,.. } if !game.paused && !game.dead && !game.death_screen_open && !game.gui_open() && !game.chat.is_open())
+            && self.world_has_pointer()
         {
             self.core.input.on_mouse_motion(delta);
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        event_loop.set_control_flow(if self.suspended {
+            winit::event_loop::ControlFlow::Wait
+        } else {
+            winit::event_loop::ControlFlow::Poll
+        });
     }
 }

@@ -1,4 +1,5 @@
 pub mod block_entity_model;
+pub mod boot;
 pub mod camera;
 pub mod chunk;
 mod context;
@@ -186,6 +187,9 @@ pub struct Renderer {
     render_finished_per_image: Vec<vk::Semaphore>,
     screenshot: screenshot::ScreenshotCapture,
     swapchain_dirty: bool,
+    /// The native window is gone (Android backgrounded the app), and with it
+    /// the surface and swapchain; nothing renders until `resume`.
+    suspended: bool,
     /// Id of the last present tagged via `VK_KHR_present_id`; per swapchain.
     present_id: u64,
     vsync: bool,
@@ -220,38 +224,14 @@ impl Renderer {
             })
         };
 
-        let ctx = VulkanContext::new(&window)?;
-
-        let swapchain_state = Swapchain::new(
-            &ctx,
-            size.width.max(1),
-            size.height.max(1),
-            vsync,
-            vk::SwapchainKHR::null(),
-        )?;
+        let (ctx, swapchain_state, mut menu_pipeline) =
+            boot::bring_up(&window, font_sources, vsync)?;
         // The swapchain may pick the surface's `current_extent` rather than the
         // requested size; track that actual extent so layout matches rendering.
         let swapchain_extent = swapchain_state.extent;
-        let font_layer_limit = ctx
-            .physical_device
-            .get_properties()
-            .limits
-            .max_image_array_layers;
-
-        let mut menu_pipeline = MenuOverlayPipeline::new(
-            &ctx.device,
-            ctx.graphics_queue,
-            ctx.command_pool,
-            swapchain_state.render_pass,
-            &ctx.allocator,
-            font_sources,
-            font_layer_limit,
-        )
-        .map_err(RendererError::Font)?;
 
         let sw = size.width.max(1) as f32;
         let sh = size.height.max(1) as f32;
-        window.set_visible(true);
 
         let splash = |menu: &mut MenuOverlayPipeline, progress: f32, status: &str| {
             let _ = Self::render_splash(&ctx, &swapchain_state, menu, sw, sh, progress, status);
@@ -429,6 +409,7 @@ impl Renderer {
             ctx.physical_device,
             ctx.graphics_family,
             &ctx.allocator,
+            ctx.indirect_draw,
         );
 
         let mut item_entity_pipeline = pipelines::item_entity::ItemEntityPipeline::new(
@@ -507,6 +488,7 @@ impl Renderer {
             render_finished_per_image,
             screenshot: screenshot::ScreenshotCapture::new(game_dir.to_path_buf()),
             swapchain_dirty: false,
+            suspended: false,
             present_id: 0,
             vsync,
             width: swapchain_extent.width,
@@ -529,7 +511,7 @@ impl Renderer {
         let cmd = ctx.command_buffers[0];
 
         let gs = (sh / 400.0).max(1.0);
-        let title_size = 28.0 * gs;
+        let logo_size = 48.0 * gs;
         let status_size = 8.0 * gs;
         let bar_w = 200.0 * gs;
         let bar_h = 6.0 * gs;
@@ -538,13 +520,13 @@ impl Renderer {
         let cy = sh / 2.0;
 
         let elements = vec![
-            MenuElement::Text {
-                x: cx,
-                y: cy - title_size - 20.0 * gs,
-                text: "Pomme".into(),
-                scale: title_size,
-                color: [0.86, 0.92, 1.0, 0.95],
-                centered: true,
+            MenuElement::Image {
+                x: cx - logo_size / 2.0,
+                y: cy - logo_size - 16.0 * gs,
+                w: logo_size,
+                h: logo_size,
+                sprite: pipelines::menu_overlay::SpriteId::PommeLogo,
+                tint: [1.0; 4],
             },
             MenuElement::Rect {
                 x: cx - bar_w / 2.0 - bar_border,
@@ -682,6 +664,25 @@ impl Renderer {
             .set_aspect_ratio(new_size.width as f32 / new_size.height as f32);
     }
 
+    /// Drops the surface and swapchain when Android takes the native window,
+    /// keeping the device and every other resource.
+    pub fn suspend(&mut self) {
+        let _ = self.ctx.device.wait_idle();
+        self.swapchain.release_surface(&self.ctx.device);
+        self.ctx.destroy_surface();
+        self.suspended = true;
+    }
+
+    /// Rebuilds the surface and swapchain for the window Android hands back.
+    pub fn resume(&mut self, window: &Window) -> Result<(), RendererError> {
+        if !self.suspended {
+            return Ok(());
+        }
+        self.ctx.recreate_surface(window)?;
+        self.suspended = false;
+        self.recreate_swapchain()
+    }
+
     pub fn set_vsync(&mut self, vsync: bool) {
         if self.vsync != vsync {
             self.vsync = vsync;
@@ -696,7 +697,10 @@ impl Renderer {
         const PACE_TIMEOUT_NS: u64 = 100_000_000;
 
         self.last_timings.pace_ms = 0.0;
-        if self.swapchain_dirty || self.swapchain.present_mode != vk::PresentModeKHR::Fifo {
+        if self.suspended
+            || self.swapchain_dirty
+            || self.swapchain.present_mode != vk::PresentModeKHR::Fifo
+        {
             return;
         }
         let t_pace = std::time::Instant::now();
@@ -1477,6 +1481,9 @@ impl Renderer {
         clear_color: [f32; 4],
         mut mode: RenderMode<'_>,
     ) -> Result<(), RendererError> {
+        if self.suspended {
+            return Ok(());
+        }
         if self.swapchain_dirty {
             self.recreate_swapchain()?;
         }
@@ -2210,7 +2217,9 @@ pub(crate) async fn fetch_skin_texture_by_name(name: &str) -> Result<SkinData, S
         .map_err(|()| "profile url cannot take a path".to_owned())?
         .pop_if_empty()
         .push(name);
-    let response = reqwest::get(url).await.map_err(error_chain)?;
+    let response = crate::net::http::get(url)
+        .await
+        .map_err(pomme_auth::error_chain)?;
     if matches!(
         response.status(),
         reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND
@@ -2219,10 +2228,10 @@ pub(crate) async fn fetch_skin_texture_by_name(name: &str) -> Result<SkinData, S
     }
     let profile: NamedProfile = response
         .error_for_status()
-        .map_err(error_chain)?
+        .map_err(pomme_auth::error_chain)?
         .json()
         .await
-        .map_err(error_chain)?;
+        .map_err(pomme_auth::error_chain)?;
     fetch_skin_texture(&profile.id).await
 }
 
@@ -2238,7 +2247,9 @@ pub(crate) async fn fetch_skin_texture(uuid: &str) -> Result<SkinData, String> {
     }
 
     let url = format!("https://sessionserver.mojang.com/session/minecraft/profile/{uuid}");
-    let response = reqwest::get(&url).await.map_err(error_chain)?;
+    let response = crate::net::http::get(&url)
+        .await
+        .map_err(pomme_auth::error_chain)?;
     if matches!(
         response.status(),
         reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND
@@ -2247,10 +2258,10 @@ pub(crate) async fn fetch_skin_texture(uuid: &str) -> Result<SkinData, String> {
     }
     let profile: SessionProfile = response
         .error_for_status()
-        .map_err(error_chain)?
+        .map_err(pomme_auth::error_chain)?
         .json()
         .await
-        .map_err(error_chain)?;
+        .map_err(pomme_auth::error_chain)?;
 
     let value = &profile
         .properties
@@ -2330,8 +2341,9 @@ fn skin_url_from_texture_property(value: &str) -> Result<(String, bool), String>
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
-        .map_err(error_chain)?;
-    let payload: TexturesPayload = serde_json::from_slice(&decoded).map_err(error_chain)?;
+        .map_err(pomme_auth::error_chain)?;
+    let payload: TexturesPayload =
+        serde_json::from_slice(&decoded).map_err(pomme_auth::error_chain)?;
 
     // authlib `unpackTextures`: one bad url empties the whole payload.
     // TODO: vanilla also shows the default skin for other players whose
@@ -2373,32 +2385,17 @@ fn is_allowed_texture_url(url: &str) -> bool {
     matches!(scheme, "http" | "https") && host == HOST && port_ok
 }
 
-/// Error message including the source chain (`reqwest` hides the detail there).
-fn error_chain(e: impl std::error::Error) -> String {
-    let mut msg = e.to_string();
-    let mut source = e.source();
-    while let Some(s) = source {
-        let text = s.to_string();
-        if !msg.contains(&text) {
-            msg.push_str(": ");
-            msg.push_str(&text);
-        }
-        source = s.source();
-    }
-    msg
-}
-
 async fn fetch_skin_image(skin_url: &str) -> Result<(Vec<u8>, u32, u32), String> {
-    let skin_bytes = reqwest::get(skin_url)
+    let skin_bytes = crate::net::http::get(skin_url)
         .await
-        .map_err(error_chain)?
+        .map_err(pomme_auth::error_chain)?
         .error_for_status()
-        .map_err(error_chain)?
+        .map_err(pomme_auth::error_chain)?
         .bytes()
         .await
-        .map_err(error_chain)?;
+        .map_err(pomme_auth::error_chain)?;
 
-    let img = image::load_from_memory(&skin_bytes).map_err(error_chain)?;
+    let img = image::load_from_memory(&skin_bytes).map_err(pomme_auth::error_chain)?;
     let rgba = img.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
