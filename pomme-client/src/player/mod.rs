@@ -201,6 +201,13 @@ pub struct LocalPlayer {
     pub main_supporting_block_pos: Option<crate::position::BlockPos>,
     /// Vanilla `Entity.onGroundNoBlocks`.
     pub on_ground_no_blocks: bool,
+    /// Vanilla `Entity.pistonDeltas`: this game tick's piston movement per
+    /// axis, capped at 0.51.
+    pub piston_deltas: [f64; 3],
+    pub piston_deltas_tick: u64,
+    /// Vanilla `zza`/`xxa`: the move input the last `aiStep` travelled with.
+    pub move_forward: f32,
+    pub move_strafe: f32,
     pub sprint_toggle_timer: u32,
     /// Last tick's input, as `LocalPlayer.aiStep` samples it.
     pub was_forward_pressed: bool,
@@ -302,6 +309,10 @@ impl LocalPlayer {
             minor_horizontal_collision: false,
             main_supporting_block_pos: None,
             on_ground_no_blocks: false,
+            piston_deltas: [0.0; 3],
+            piston_deltas_tick: 0,
+            move_forward: 0.0,
+            move_strafe: 0.0,
             sprint_toggle_timer: 0,
             was_forward_pressed: false,
             was_shift_pressed: false,

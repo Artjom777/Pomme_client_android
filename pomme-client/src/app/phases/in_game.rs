@@ -2268,6 +2268,7 @@ pub fn update_game(
         game.item_entity_store.tick(&game.chunk_store);
         game.particle_store.tick(&game.chunk_store);
         game.block_entity_anim.tick();
+        crate::app::core::tick_moving_pistons(core, game);
         game.title.tick();
         tick_tool_highlight(core, game);
         // LocalPlayer.handlePortalTransitionEffect belongs to aiStep, which is
@@ -3924,6 +3925,9 @@ pub fn update_game(
         )
     };
 
+    let moving_block_renders =
+        moving_block_renders(game, gfx.renderer.camera_render_position(), partial_tick);
+
     let shadow_casters = if core.menu.entity_shadows && !benchmark_running {
         shadow_casters(
             &entity_renders,
@@ -4056,6 +4060,7 @@ pub fn update_game(
             sky_darken: game.sky_darken(),
             ambient_light: game.ambient_light,
         },
+        &moving_block_renders,
         &entity_renders,
         &item_renders,
         &block_entity_renders,
@@ -4471,6 +4476,54 @@ fn emit_item_copies(
             push(glam::Mat4::from_translation(off));
         }
     }
+}
+
+/// Vanilla `PistonHeadRenderer.extractRenderState`: each moving block, meshed
+/// as terrain at its offset from the moving piston's cell and lit from the
+/// cell it left. A retracting piston also draws its base, extended, in place.
+fn moving_block_renders(
+    game: &GameState,
+    camera_pos: glam::DVec3,
+    partial_tick: f32,
+) -> Vec<crate::renderer::chunk::moving_blocks::MovingBlockRender> {
+    use crate::world::block::{block_id, is_air, with_property};
+    use crate::world::piston;
+    /// Vanilla `PistonHeadRenderer.getViewDistance`.
+    const VIEW_DISTANCE: f64 = 68.0;
+    let mut renders = Vec::new();
+    for (pos, moving) in game.block_entity_anim.pistons.iter() {
+        let state = moving.moved_state;
+        let center = glam::DVec3::new(pos.x as f64, pos.y as f64, pos.z as f64) + 0.5;
+        if is_air(state) || center.distance_squared(camera_pos) >= VIEW_DISTANCE * VIEW_DISTANCE {
+            continue;
+        }
+        let origin = [pos.x, pos.y, pos.z];
+        let cell = piston::relative(*pos, moving.movement_direction().opposite(), 1);
+        let cell = [cell.x, cell.y, cell.z];
+        let mut mesh = |state, cell, base| {
+            renders.push(crate::renderer::chunk::moving_blocks::MovingBlockRender {
+                origin,
+                mesh: game
+                    .mesh_dispatcher
+                    .mesh_moving_block(&game.chunk_store, state, cell, base),
+            });
+        };
+        let progress = moving.progress(partial_tick);
+        let offset = moving.offset(partial_tick);
+        if block_id(state) == "piston_head" && progress <= 4.0 {
+            mesh(piston::with_short(state, progress <= 0.5), cell, offset);
+        } else if moving.source && !moving.extending {
+            let Some(head) = piston::head_of(state, progress >= 0.5) else {
+                continue;
+            };
+            mesh(head, cell, offset);
+            let base = with_property(state, "extended", "true").unwrap_or(state);
+            mesh(base, origin, [0.0; 3]);
+        } else {
+            mesh(state, cell, offset);
+        }
+    }
+    renders
 }
 
 /// Vanilla `extractShadow`'s casters: every rendered entity, and each resting

@@ -217,6 +217,13 @@ impl MeshSink {
     }
 }
 
+/// One moving block's terrain mesh, from [`MeshDispatcher::mesh_moving_block`].
+pub struct MovingBlockMesh {
+    pub vertices: Vec<PackedVertex>,
+    pub solid: Vec<u32>,
+    pub cutout: Vec<u32>,
+}
+
 pub struct ChunkMeshData {
     pub pos: ChunkPos,
     /// World Y of section index 0, so the buffer can derive each section's
@@ -876,6 +883,51 @@ impl MeshDispatcher {
         mesh
     }
 
+    /// Vanilla `MovingBlockFeatureRenderer`: one block tessellated as terrain
+    /// against a world that is air apart from it, so every face draws and only
+    /// the light and biome come from the level. `cell` is the block's
+    /// `MovingBlockRenderState.blockPos` (light, biome and model offset);
+    /// vertices sit at `base` plus the model, in the coordinates of whatever
+    /// origin the caller draws them at.
+    pub fn mesh_moving_block(
+        &self,
+        chunk_store: &ChunkStore,
+        state: azalea_block::BlockState,
+        cell: [i32; 3],
+        base: [f32; 3],
+    ) -> MovingBlockMesh {
+        let [x, y, z] = cell;
+        let mut snapshot = self.build_snapshot(
+            chunk_store,
+            ChunkPos::new(x.div_euclid(16), z.div_euclid(16)),
+        );
+        let blocks = GridBox::spanning([x - 1, y - 1, z - 1], [x + 1, y + 1, z + 1]);
+        let mut states = vec![azalea_block::BlockState::AIR; blocks.len()];
+        states[blocks.index(cell).expect("the cell is the box's centre")] = state;
+        snapshot.blocks = Some(BlockSlice { blocks, states });
+        snapshot.tint_biome = Some(snapshot.get_biome(x, y, z));
+
+        let mut sink = MeshSink::default();
+        let model_offset = crate::world::block::block_position_offset(state, x, z);
+        let model_pos = (glam::Vec3::from(base) + model_offset.as_vec3()).to_array();
+        emit_block_model(
+            &mut sink,
+            model_pos,
+            state,
+            &snapshot,
+            &self.registry,
+            &self.uv_map,
+            x,
+            y,
+            z,
+        );
+        MovingBlockMesh {
+            vertices: sink.vertices.iter().map(pack_vertex).collect(),
+            solid: sink.solid,
+            cutout: sink.cutout,
+        }
+    }
+
     /// Point-in-time snapshot of `pos`'s mesh neighbourhood: chunk arcs plus
     /// shared handles to their light data.
     fn build_snapshot(&self, chunk_store: &ChunkStore, pos: ChunkPos) -> ChunkStoreSnapshot {
@@ -904,6 +956,7 @@ impl MeshDispatcher {
             blocks: None,
             climates: None,
             light_levels: None,
+            tint_biome: None,
         }
     }
 
@@ -1217,6 +1270,10 @@ struct ChunkStoreSnapshot {
     climates: Option<ClimateCache>,
     /// The meshed span's light levels, filled as faces sample them.
     light_levels: Option<LazyGrid<u8>>,
+    /// One biome every tint reads, unblended: vanilla `MovingBlockRenderState`
+    /// tints a moving block from the biome of the cell it left. `None` for
+    /// terrain, which blends the biomes around each block.
+    tint_biome: Option<u32>,
 }
 
 /// An axis-aligned box of grid cells, laid out X-major then Z, Y innermost
@@ -1409,6 +1466,9 @@ impl ChunkStoreSnapshot {
     }
 
     fn climate_at(&self, x: i32, y: i32, z: i32) -> BiomeClimate {
+        if let Some(biome) = self.tint_biome {
+            return self.biome_climate_of(biome);
+        }
         let biome = || self.get_biome(x, y, z);
         let Some(cache) = &self.climates else {
             return self.biome_climate_of(biome());
@@ -1454,18 +1514,30 @@ impl ChunkStoreSnapshot {
     }
 
     fn grass_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
+        if self.tint_biome.is_some() {
+            return self.grass_color_at(x, y, z);
+        }
         blend_color(x, z, |bx, bz| self.grass_color_at(bx, y, bz))
     }
 
     fn foliage_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
+        if self.tint_biome.is_some() {
+            return self.foliage_color_at(x, y, z);
+        }
         blend_color(x, z, |bx, bz| self.foliage_color_at(bx, y, bz))
     }
 
     fn dry_foliage_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
+        if self.tint_biome.is_some() {
+            return self.dry_foliage_color_at(x, y, z);
+        }
         blend_color(x, z, |bx, bz| self.dry_foliage_color_at(bx, y, bz))
     }
 
     fn water_tint(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
+        if self.tint_biome.is_some() {
+            return self.water_color_at(x, y, z);
+        }
         blend_color(x, z, |bx, bz| self.water_color_at(bx, y, bz))
     }
 
@@ -1654,24 +1726,13 @@ fn mesh_chunk_snapshot(
                     emit_fluid(
                         sink, kind, block_pos, state, snapshot, registry, uv_map, bx, by, bz,
                     );
-                } else if let Some(baked) = registry.get_baked_model(state) {
-                    emit_baked_model(
-                        sink, model_pos, state, baked, snapshot, registry, uv_map, bx, by, bz,
-                    );
-                } else if let Some(quads) = registry.get_multipart_quads(state) {
-                    emit_multipart(
-                        sink, model_pos, state, &quads, snapshot, registry, uv_map, bx, by, bz,
-                    );
-                } else if let Some(textures) = registry.get_textures(state) {
-                    emit_cube_faces(
-                        sink, model_pos, state, textures, snapshot, registry, uv_map, bx, by, bz,
-                    );
-                } else {
+                } else if !emit_block_model(
+                    sink, model_pos, state, snapshot, registry, uv_map, bx, by, bz,
+                ) {
                     let id = crate::world::block::block_id(state);
                     if logged_missing.insert(id) {
                         tracing::warn!("Missing model: {id}");
                     }
-                    emit_missing_cube(sink, model_pos, snapshot, registry, uv_map, bx, by, bz);
                 }
                 by += step;
             }
@@ -1720,6 +1781,41 @@ fn mesh_chunk_snapshot(
         queue_ms: 0.0,
         mesh_ms: 0.0,
     }
+}
+
+/// A block's model: its baked variant, multipart quads or plain cube, else
+/// the missing cube, in which case it returns `false`.
+// Inlined: a call here costs the chunk mesher ~3%.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn emit_block_model(
+    sink: &mut MeshSink,
+    model_pos: [f32; 3],
+    state: azalea_block::BlockState,
+    snapshot: &ChunkStoreSnapshot,
+    registry: &BlockRegistry,
+    uv_map: &AtlasUVMap,
+    bx: i32,
+    by: i32,
+    bz: i32,
+) -> bool {
+    if let Some(baked) = registry.get_baked_model(state) {
+        emit_baked_model(
+            sink, model_pos, state, baked, snapshot, registry, uv_map, bx, by, bz,
+        );
+    } else if let Some(quads) = registry.get_multipart_quads(state) {
+        emit_multipart(
+            sink, model_pos, state, &quads, snapshot, registry, uv_map, bx, by, bz,
+        );
+    } else if let Some(textures) = registry.get_textures(state) {
+        emit_cube_faces(
+            sink, model_pos, state, textures, snapshot, registry, uv_map, bx, by, bz,
+        );
+    } else {
+        emit_missing_cube(sink, model_pos, snapshot, registry, uv_map, bx, by, bz);
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

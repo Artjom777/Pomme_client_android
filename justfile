@@ -181,7 +181,8 @@ jdk := "C:/Program Files/Amazon Corretto/jdk25.0.2_10/bin"
 # Regenerate a version's per-state property table by running vanilla's own code
 # (tools/stategen/StateDump.java) against the reference server jar, then
 # compacting the dump with `blockgen state`. Uses the deobf server jar when
-# one exists (pre-26.x); needs the Corretto JDK for 26.x class files.
+# one exists (pre-26.x); needs the Corretto JDK for 26.x class files. Also
+# writes the version's per-block piston table (piston-<version>.json).
 stategen version="26.2":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -198,5 +199,5 @@ stategen version="26.2":
     libs=$(find "$ref/bundler" -name '*.jar' | tr '\n' ';')
     mkdir -p tools/stategen/out
     "$jdk/javac.exe" --release 21 -d tools/stategen/out tools/stategen/StateDump.java
-    "$jdk/java.exe" -cp "$classes;${libs}tools/stategen/out" StateDump "$v" "$ref/generated/state.json"
+    "$jdk/java.exe" -cp "$classes;${libs}tools/stategen/out" StateDump "$v" "$ref/generated/state.json" pomme-client/src/world/block/data/piston-"$v".json
     cargo run -p blockgen -- state "$ref/generated/state.json" pomme-client/src/world/block/data/blocks-"$v".json pomme-client/src/world/block/data/state-"$v".json
