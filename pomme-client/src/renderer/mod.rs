@@ -636,7 +636,16 @@ impl Renderer {
         cmd.set_scissor(0, &[scissor]);
 
         let empty_uvs: HashMap<String, [f32; 4]> = HashMap::new();
-        menu.draw(cmd, 0, sw, sh, &elements, &empty_uvs);
+        menu.draw(
+            &ctx.device,
+            &ctx.allocator,
+            cmd,
+            0,
+            sw,
+            sh,
+            &elements,
+            &empty_uvs,
+        );
 
         cmd.end_render_pass();
         cmd.end()?;
@@ -2015,8 +2024,16 @@ impl Renderer {
                     }
                 }
 
-                self.menu_pipeline
-                    .draw(cmd, frame, sw, sh, overlay, &item_atlas_uvs);
+                self.menu_pipeline.draw(
+                    &self.ctx.device,
+                    &self.ctx.allocator,
+                    cmd,
+                    frame,
+                    sw,
+                    sh,
+                    overlay,
+                    &item_atlas_uvs,
+                );
 
                 // Each preview box gets its depth cleared and its own scissor
                 // while the 3D content draws.
@@ -2072,6 +2089,8 @@ impl Renderer {
                 let mut vbase = 0u32;
                 if let Some(i) = split {
                     vbase = self.menu_pipeline.draw_from(
+                        &self.ctx.device,
+                        &self.ctx.allocator,
                         cmd,
                         frame,
                         sw,
@@ -2130,8 +2149,17 @@ impl Renderer {
                     Some(i) => &elements[i + 1..],
                     None => &elements[..],
                 };
-                self.menu_pipeline
-                    .draw_from(cmd, frame, sw, sh, fg, &item_atlas_uvs, vbase);
+                self.menu_pipeline.draw_from(
+                    &self.ctx.device,
+                    &self.ctx.allocator,
+                    cmd,
+                    frame,
+                    sw,
+                    sh,
+                    fg,
+                    &item_atlas_uvs,
+                    vbase,
+                );
             }
         }
 
