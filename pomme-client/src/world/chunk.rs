@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use super::block_entity::StoredBlockEntity;
 use crate::position::{BlockPos, ChunkPos};
+use crate::world::block::BlockStateTable;
 
 pub(crate) const OVERWORLD_HEIGHT: u32 = 384;
 pub(crate) const OVERWORLD_MIN_Y: i32 = -64;
@@ -261,11 +262,21 @@ fn block_state(id: u32) -> BlockState {
 /// Vanilla `LevelChunkSection.setBlockState`: the write, then the block
 /// count, which wraps like vanilla's `short`. Returns the previous state.
 // TODO: vanilla also tracks the fluid and ticking counts here.
-fn set_section_state(section: &mut Section, x: u32, y: u32, z: u32, new: BlockState) -> BlockState {
-    use crate::world::block::{is_air, state_count};
-
+fn set_section_state(
+    section: &mut Section,
+    x: u32,
+    y: u32,
+    z: u32,
+    new: BlockState,
+    blocks: BlockStateTable,
+) -> BlockState {
+    let is_air = |state| blocks.block_state_data(state).is_air();
     let id = u32::from(new.id());
-    let previous = block_state(section.states.get_and_set(x, y, z, id, state_count()));
+    let previous = block_state(
+        section
+            .states
+            .get_and_set(x, y, z, id, blocks.state_count()),
+    );
     if !is_air(previous) {
         section.block_count = section.block_count.wrapping_sub(1);
     }
@@ -317,9 +328,9 @@ impl Chunk {
         min_y: i32,
         heightmaps: &[(HeightmapKind, Box<[u64]>)],
         biomes: usize,
+        block_states: usize,
     ) -> DecodeResult<Self> {
         let mut r = Reader::new(data);
-        let block_states = crate::world::block::state_count();
         let sections = (0..height / 16)
             .map(|_| Section::read(&mut r, block_states, biomes))
             .collect::<DecodeResult<Vec<_>>>()?;
@@ -356,11 +367,13 @@ impl Chunk {
         z: u32,
         state: BlockState,
         min_y: i32,
+        blocks: BlockStateTable,
     ) -> BlockState {
         let Some(section) = section_index(y, min_y).and_then(|i| self.sections.get_mut(i)) else {
             return BlockState::AIR;
         };
-        let previous = set_section_state(section, x, (y - min_y).rem_euclid(16) as u32, z, state);
+        let local_y = (y - min_y).rem_euclid(16) as u32;
+        let previous = set_section_state(section, x, local_y, z, state, blocks);
         for heightmap in &mut self.heightmaps {
             heightmap.update(x, y, z, state, &self.sections);
         }
@@ -493,9 +506,18 @@ impl ChunkStore {
         data: &[u8],
         heightmaps: &[(HeightmapKind, Box<[u64]>)],
         biomes: usize,
+        blocks: BlockStateTable,
     ) -> Result<(), ChunkError> {
-        let chunk = Chunk::read(data, self.height, self.min_y, heightmaps, biomes)
-            .map_err(|e| ChunkError::Parse(e.to_string()))?;
+        let block_states = blocks.state_count();
+        let chunk = Chunk::read(
+            data,
+            self.height,
+            self.min_y,
+            heightmaps,
+            biomes,
+            block_states,
+        )
+        .map_err(|e| ChunkError::Parse(e.to_string()))?;
         self.grid.replace(pos, chunk);
         Ok(())
     }
@@ -550,8 +572,15 @@ impl ChunkStore {
         self.grid.get(*pos).cloned()
     }
 
-    pub fn set_block_state(&self, x: i32, y: i32, z: i32, state: BlockState) {
-        self.set_block_state_tracked(x, y, z, state);
+    pub fn set_block_state(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        state: BlockState,
+        blocks: BlockStateTable,
+    ) {
+        self.set_block_state_tracked(x, y, z, state, blocks);
     }
 
     /// Sets a block and reports what vanilla `LevelChunk.setBlockState` feeds
@@ -564,6 +593,7 @@ impl ChunkStore {
         y: i32,
         z: i32,
         state: BlockState,
+        blocks: BlockStateTable,
     ) -> (BlockState, Option<bool>) {
         let chunk_pos = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
         let Some(chunk_lock) = self.get_chunk(&chunk_pos) else {
@@ -581,6 +611,7 @@ impl ChunkStore {
             z.rem_euclid(16) as u32,
             state,
             self.min_y,
+            blocks,
         );
         let is_empty = chunk.sections[section].block_count == 0;
         (old, (was_empty != is_empty).then_some(is_empty))
@@ -658,7 +689,6 @@ impl ChunkStore {
 impl ChunkStore {
     /// A 26.2 store with an empty chunk (0, 0) loaded.
     pub(crate) fn with_origin_chunk() -> Self {
-        crate::world::block::init("26.2");
         let mut chunks = Self::new(2);
         let sections = chunks.section_count() as usize;
         chunks.insert_chunk(ChunkPos::new(0, 0), Chunk::empty(sections));

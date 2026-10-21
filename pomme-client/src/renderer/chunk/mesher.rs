@@ -11,8 +11,8 @@ use crate::renderer::chunk::atlas::{AtlasRegion, AtlasUVMap};
 use crate::world::block::model::{
     BakedModel, CardinalLighting, Direction, face_positions, face_uvs,
 };
-use crate::world::block::registry::{BlockRegistry, Tint};
-use crate::world::block::{FluidKind, block_outline, fluid, is_air, legacy_solid, light_props};
+use crate::world::block::render_assets::{BlockRenderView, OwnedBlockRenderView, Tint};
+use crate::world::block::{BlockStateData, BlockStateTable, FluidKind};
 use crate::world::chunk;
 use crate::world::chunk::{ChunkStore, SectionBlocks};
 
@@ -296,9 +296,18 @@ impl Default for BiomeClimate {
     }
 }
 
-pub(crate) fn tint_sample_y(tint: Tint, state: BlockState, y: i32) -> i32 {
+pub(crate) fn tint_sample_y(
+    tint: Tint,
+    state: BlockState,
+    y: i32,
+    block_state_table: BlockStateTable,
+) -> i32 {
     if tint == Tint::DoubleGrass
-        && crate::world::block::block_properties(state).get("half") == Some("upper")
+        && block_state_table
+            .block_state_data(state)
+            .properties()
+            .get("half")
+            == Some("upper")
     {
         y - 1
     } else {
@@ -314,7 +323,7 @@ fn tint_color(
     y: i32,
     z: i32,
 ) -> u32 {
-    let sample_y = tint_sample_y(tint, state, y);
+    let sample_y = tint_sample_y(tint, state, y, snapshot.block_state_table);
     let color = match tint {
         Tint::None => return PACKED_WHITE_SHIFTED,
         Tint::Grass | Tint::DoubleGrass => snapshot.grass_tint(x, sample_y, z),
@@ -322,8 +331,14 @@ fn tint_color(
         Tint::DryFoliage => snapshot.dry_foliage_tint(x, sample_y, z),
         Tint::Water => snapshot.water_tint(x, sample_y, z),
         Tint::Constant(color) => int_to_rgb(color as i32),
-        Tint::Redstone => crate::world::block::redstone_wire_rgb(state),
-        Tint::Stem => crate::world::block::stem_rgb(state),
+        Tint::Redstone => snapshot
+            .block_state_table
+            .block_state_data(state)
+            .redstone_wire_rgb(),
+        Tint::Stem => snapshot
+            .block_state_table
+            .block_state_data(state)
+            .stem_rgb(),
     };
     pack_tint_shifted(color)
 }
@@ -698,7 +713,7 @@ pub struct MeshDispatcher {
     // Monotonic per-enqueue stamp; see `ChunkMeshData::upload_epoch`. Starts at 1
     // so 0 means "never uploaded" on the buffer side.
     next_epoch: AtomicU64,
-    registry: Arc<BlockRegistry>,
+    render_view: OwnedBlockRenderView,
     uv_map: Arc<AtlasUVMap>,
     grass_colormap: Arc<Colormap>,
     foliage_colormap: Arc<Colormap>,
@@ -713,8 +728,9 @@ pub struct MeshDispatcher {
 impl MeshDispatcher {
     /// [`Self::new`] with the grass, foliage and dry-foliage colormaps loaded
     /// from the assets (and resource packs).
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
-        registry: BlockRegistry,
+        render_view: OwnedBlockRenderView,
         uv_map: AtlasUVMap,
         jar_assets_dir: &std::path::Path,
         asset_index: &Option<crate::assets::AssetIndex>,
@@ -731,7 +747,7 @@ impl MeshDispatcher {
             )
         };
         Self::new(
-            registry,
+            render_view,
             uv_map,
             colormap("grass"),
             colormap("foliage"),
@@ -743,11 +759,32 @@ impl MeshDispatcher {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        registry: BlockRegistry,
+        render_view: OwnedBlockRenderView,
         uv_map: AtlasUVMap,
         grass_colormap: Colormap,
         foliage_colormap: Colormap,
         dry_foliage_colormap: Colormap,
+        biome_climate: Arc<HashMap<u32, BiomeClimate>>,
+        cardinal_lighting: CardinalLighting,
+    ) -> Self {
+        Self::with_colormaps(
+            render_view,
+            Arc::new(uv_map),
+            Arc::new(grass_colormap),
+            Arc::new(foliage_colormap),
+            Arc::new(dry_foliage_colormap),
+            biome_climate,
+            cardinal_lighting,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_colormaps(
+        render_view: OwnedBlockRenderView,
+        uv_map: Arc<AtlasUVMap>,
+        grass_colormap: Arc<Colormap>,
+        foliage_colormap: Arc<Colormap>,
+        dry_foliage_colormap: Arc<Colormap>,
         biome_climate: Arc<HashMap<u32, BiomeClimate>>,
         cardinal_lighting: CardinalLighting,
     ) -> Self {
@@ -785,11 +822,11 @@ impl MeshDispatcher {
             queue,
             workers,
             next_epoch: AtomicU64::new(1),
-            registry: Arc::new(registry),
-            uv_map: Arc::new(uv_map),
-            grass_colormap: Arc::new(grass_colormap),
-            foliage_colormap: Arc::new(foliage_colormap),
-            dry_foliage_colormap: Arc::new(dry_foliage_colormap),
+            render_view,
+            uv_map,
+            grass_colormap,
+            foliage_colormap,
+            dry_foliage_colormap,
             biome_climate,
             cardinal_lighting,
             pool: Arc::new(BufferPool::new(1024)),
@@ -803,6 +840,20 @@ impl MeshDispatcher {
             self.pool.recycle_vertices(sec.vertices);
             self.pool.recycle_indices(sec.indices);
         }
+    }
+
+    /// Negotiation precedes world population. Capture the session's new view
+    /// of the same CPU assets, retaining UVs, colormaps and dimension lighting.
+    pub(crate) fn recreate_for_version(&self, render_view: OwnedBlockRenderView) -> Self {
+        Self::with_colormaps(
+            render_view,
+            Arc::clone(&self.uv_map),
+            Arc::clone(&self.grass_colormap),
+            Arc::clone(&self.foliage_colormap),
+            Arc::clone(&self.dry_foliage_colormap),
+            Arc::clone(&self.biome_climate),
+            self.cardinal_lighting,
+        )
     }
 
     pub fn set_biome_climate(&mut self, climate: Arc<HashMap<u32, BiomeClimate>>) {
@@ -848,7 +899,7 @@ impl MeshDispatcher {
             is_recompile: priority,
             enqueued_at,
             snapshot: self.build_snapshot(chunk_store, pos),
-            registry: Arc::clone(&self.registry),
+            render_view: self.render_view.clone(),
             uv_map: Arc::clone(&self.uv_map),
             tx,
             pool: Arc::clone(&self.pool),
@@ -871,7 +922,7 @@ impl MeshDispatcher {
         let mut mesh = mesh_chunk_snapshot(
             &mut snapshot,
             pos,
-            &self.registry,
+            self.render_view.as_view(),
             &self.uv_map,
             0,
             sections,
@@ -908,14 +959,17 @@ impl MeshDispatcher {
         snapshot.tint_biome = Some(snapshot.get_biome(x, y, z));
 
         let mut sink = MeshSink::default();
-        let model_offset = crate::world::block::block_position_offset(state, x, z);
+        let model_offset = snapshot
+            .block_state_table
+            .block_state_data(state)
+            .block_position_offset(x, z);
         let model_pos = (glam::Vec3::from(base) + model_offset.as_vec3()).to_array();
         emit_block_model(
             &mut sink,
             model_pos,
             state,
             &snapshot,
-            &self.registry,
+            self.render_view.as_view(),
             &self.uv_map,
             x,
             y,
@@ -933,6 +987,7 @@ impl MeshDispatcher {
     fn build_snapshot(&self, chunk_store: &ChunkStore, pos: ChunkPos) -> ChunkStoreSnapshot {
         let chunks_needed = chunk::mesh_neighborhood(pos);
         ChunkStoreSnapshot {
+            block_state_table: self.render_view.block_state_table(),
             chunks: chunks_needed
                 .iter()
                 .map(|p| (*p, chunk_store.get_chunk(p)))
@@ -1000,7 +1055,7 @@ struct PendingJob {
     is_recompile: bool,
     enqueued_at: std::time::Instant,
     snapshot: ChunkStoreSnapshot,
-    registry: Arc<BlockRegistry>,
+    render_view: OwnedBlockRenderView,
     uv_map: Arc<AtlasUVMap>,
     tx: crossbeam_channel::Sender<ChunkMeshData>,
     pool: Arc<BufferPool>,
@@ -1016,7 +1071,7 @@ impl PendingJob {
         let mut mesh = mesh_chunk_snapshot(
             &mut self.snapshot,
             self.pos,
-            &self.registry,
+            self.render_view.as_view(),
             &self.uv_map,
             self.lod,
             self.sections,
@@ -1255,6 +1310,7 @@ fn lower_current_thread_priority() {
 }
 
 struct ChunkStoreSnapshot {
+    block_state_table: BlockStateTable,
     chunks: Vec<(ChunkPos, Option<Arc<parking_lot::RwLock<chunk::Chunk>>>)>,
     light: std::collections::HashMap<(i32, i32), Arc<crate::world::chunk::ChunkLightData>>,
     grass_colormap: Arc<Colormap>,
@@ -1578,7 +1634,7 @@ pub fn world_brightness(chunks: &ChunkStore, x: i32, y: i32, z: i32) -> f32 {
 /// Whether a section provably emits nothing: every block is hidden once
 /// enclosed, and every block touching it from outside occludes. `at` reads
 /// section-relative coordinates.
-fn section_hidden(registry: &BlockRegistry, at: impl Fn(i32, i32, i32) -> BlockState) -> bool {
+fn section_hidden(registry: BlockRenderView<'_>, at: impl Fn(i32, i32, i32) -> BlockState) -> bool {
     let occludes = |x, y, z| registry.occludes_neighbor(at(x, y, z));
     let border_occludes = (0..16).all(|a| {
         (0..16).all(|b| {
@@ -1598,7 +1654,7 @@ fn section_hidden(registry: &BlockRegistry, at: impl Fn(i32, i32, i32) -> BlockS
 fn mesh_chunk_snapshot(
     snapshot: &mut ChunkStoreSnapshot,
     pos: ChunkPos,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     lod: u32,
     sections_to_mesh: std::ops::Range<i32>,
@@ -1681,14 +1737,14 @@ fn mesh_chunk_snapshot(
                     continue;
                 }
                 let mut state = snapshot.get_block_state(bx, by, bz);
-                let mut kind = classify_block(state);
+                let mut kind = classify_block(snapshot.block_state_table.block_state_data(state));
                 // Checks for non air block in the cube region to represent the area if the
                 // picked block is air
                 if lod > 0 && matches!(kind, BlockKind::Air) {
                     let end_y = (by + step).min(by_end);
                     for try_y in (by + 1)..end_y {
                         let s = snapshot.get_block_state(bx, try_y, bz);
-                        let k = classify_block(s);
+                        let k = classify_block(snapshot.block_state_table.block_state_data(s));
                         if !matches!(k, BlockKind::Air) {
                             state = s;
                             kind = k;
@@ -1715,7 +1771,10 @@ fn mesh_chunk_snapshot(
                     (by - (min_y + s as i32 * 16)) as f32,
                     (bz - world_z) as f32,
                 ];
-                let model_offset = crate::world::block::block_position_offset(state, bx, bz);
+                let model_offset = snapshot
+                    .block_state_table
+                    .block_state_data(state)
+                    .block_position_offset(bx, bz);
                 let model_pos = (glam::Vec3::from(block_pos) + model_offset.as_vec3()).to_array();
 
                 if lod > 0 {
@@ -1729,7 +1788,7 @@ fn mesh_chunk_snapshot(
                 } else if !emit_block_model(
                     sink, model_pos, state, snapshot, registry, uv_map, bx, by, bz,
                 ) {
-                    let id = crate::world::block::block_id(state);
+                    let id = snapshot.block_state_table.block_state_data(state).id();
                     if logged_missing.insert(id) {
                         tracing::warn!("Missing model: {id}");
                     }
@@ -1793,7 +1852,7 @@ fn emit_block_model(
     model_pos: [f32; 3],
     state: azalea_block::BlockState,
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     bx: i32,
     by: i32,
@@ -1825,7 +1884,7 @@ fn emit_baked_model(
     state: azalea_block::BlockState,
     model: &BakedModel,
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     bx: i32,
     by: i32,
@@ -1864,9 +1923,9 @@ fn emit_cube_faces(
     sink: &mut MeshSink,
     block_pos: [f32; 3],
     state: BlockState,
-    textures: &crate::world::block::registry::FaceTextures,
+    textures: &crate::world::block::render_assets::FaceTextures,
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     bx: i32,
     by: i32,
@@ -1934,11 +1993,11 @@ enum BlockKind {
     Solid,
 }
 
-fn classify_block(state: azalea_block::BlockState) -> BlockKind {
-    if is_air(state) {
+fn classify_block(block_state_data: &BlockStateData) -> BlockKind {
+    if block_state_data.is_air() {
         return BlockKind::Air;
     }
-    match crate::world::block::block_id(state) {
+    match block_state_data.id() {
         "cave_air" | "void_air" | "light" | "barrier" | "structure_void" | "moving_piston" => {
             BlockKind::Air
         }
@@ -1957,18 +2016,18 @@ const MAX_FLUID_HEIGHT: f32 = 8.0 / 9.0;
 /// `FluidRenderer`'s `offs` anti-z-fighting inset.
 const FLUID_INSET: f32 = 0.001;
 
-fn same_fluid(state: azalea_block::BlockState, kind: FluidKind) -> bool {
-    fluid(state).kind == kind
+fn same_fluid(block_state_data: &BlockStateData, kind: FluidKind) -> bool {
+    block_state_data.fluid().kind == kind
 }
 
 /// Vanilla `FluidRenderer.isFaceOccludedByState` over the generated 16x16
 /// face masks; on side faces the fluid box covers rows `0..height`.
 fn fluid_face_occluded_by_state(
-    state: azalea_block::BlockState,
+    block_state_data: &BlockStateData,
     direction: Direction,
     height: f32,
 ) -> bool {
-    let props = light_props(state);
+    let props = block_state_data.light_props();
     if !props.can_occlude {
         return false;
     }
@@ -1976,7 +2035,7 @@ fn fluid_face_occluded_by_state(
         Some(masks) => masks[direction.opposite() as usize][v] == 0xFFFF,
         // TODO: masks are only dumped for useShapeForLightOcclusion states, so
         // other partial occlusion shapes (fence posts, chests) count as empty.
-        None => block_outline(state).is_none(),
+        None => block_state_data.outline_boxes().is_none(),
     };
     let rows = match direction {
         // `Shapes.blockOccludes` needs the fluid box to reach the top boundary.
@@ -1987,8 +2046,8 @@ fn fluid_face_occluded_by_state(
     (0..rows).all(full_row)
 }
 
-fn fluid_face_occluded_by_self(state: azalea_block::BlockState, direction: Direction) -> bool {
-    fluid_face_occluded_by_state(state, direction.opposite(), 1.0)
+fn fluid_face_occluded_by_self(block_state_data: &BlockStateData, direction: Direction) -> bool {
+    fluid_face_occluded_by_state(block_state_data, direction.opposite(), 1.0)
 }
 
 fn fluid_render_height(
@@ -1999,14 +2058,20 @@ fn fluid_render_height(
     z: i32,
 ) -> f32 {
     let state = snapshot.get_block_state(x, y, z);
-    let state_fluid = fluid(state);
+    let block_state_data = snapshot.block_state_table.block_state_data(state);
+    let state_fluid = block_state_data.fluid();
     if state_fluid.kind == kind {
-        if same_fluid(snapshot.get_block_state(x, y + 1, z), kind) {
+        if same_fluid(
+            snapshot
+                .block_state_table
+                .block_state_data(snapshot.get_block_state(x, y + 1, z)),
+            kind,
+        ) {
             1.0
         } else {
             state_fluid.height()
         }
-    } else if !legacy_solid(state) {
+    } else if !block_state_data.legacy_solid() {
         0.0
     } else {
         -1.0
@@ -2083,12 +2148,12 @@ fn block_face_tex_tint(
     dir: Direction,
     uv_map: &AtlasUVMap,
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     bx: i32,
     by: i32,
     bz: i32,
 ) -> (AtlasRegion, u32) {
-    match classify_block(state) {
+    match classify_block(snapshot.block_state_table.block_state_data(state)) {
         BlockKind::Water => (
             uv_map.get_region("water_still"),
             pack_tint_shifted(snapshot.water_tint(bx, by, bz)),
@@ -2120,7 +2185,7 @@ fn emit_fluid(
     block_pos: [f32; 3],
     state: azalea_block::BlockState,
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     bx: i32,
     by: i32,
@@ -2142,7 +2207,9 @@ fn emit_fluid(
         solid
     };
 
-    let fluid_kind = fluid(state).kind;
+    let block_state_table = snapshot.block_state_table;
+    let block_state_data = block_state_table.block_state_data(state);
+    let fluid_kind = block_state_data.fluid().kind;
     debug_assert!(matches!(fluid_kind, FluidKind::Water | FluidKind::Lava));
     let above = snapshot.get_block_state(bx, by + 1, bz);
     let below = snapshot.get_block_state(bx, by - 1, bz);
@@ -2150,11 +2217,19 @@ fn emit_fluid(
     // The occlusion test sees the surface before the top face's inset.
     let mut heights = fluid_corner_heights(snapshot, fluid_kind, bx, by, bz);
     let min_top = heights.iter().copied().fold(1.0_f32, f32::min);
-    let render_up = !same_fluid(above, fluid_kind)
-        && !fluid_face_occluded_by_state(above, Direction::Up, min_top);
-    let render_down = !same_fluid(below, fluid_kind)
-        && !fluid_face_occluded_by_self(state, Direction::Down)
-        && !fluid_face_occluded_by_state(below, Direction::Down, MAX_FLUID_HEIGHT);
+    let render_up = !same_fluid(block_state_table.block_state_data(above), fluid_kind)
+        && !fluid_face_occluded_by_state(
+            block_state_table.block_state_data(above),
+            Direction::Up,
+            min_top,
+        );
+    let render_down = !same_fluid(block_state_table.block_state_data(below), fluid_kind)
+        && !fluid_face_occluded_by_self(block_state_data, Direction::Down)
+        && !fluid_face_occluded_by_state(
+            block_state_table.block_state_data(below),
+            Direction::Down,
+            MAX_FLUID_HEIGHT,
+        );
     let bottom_offset = if render_down { FLUID_INSET } else { 0.0 };
 
     if render_up {
@@ -2168,7 +2243,7 @@ fn emit_fluid(
         let offset = dir.offset();
         let neighbor = snapshot.get_block_state(bx + offset[0], by + offset[1], bz + offset[2]);
 
-        if same_fluid(neighbor, fluid_kind) {
+        if same_fluid(block_state_table.block_state_data(neighbor), fluid_kind) {
             continue;
         }
 
@@ -2219,8 +2294,12 @@ fn emit_fluid(
                     Direction::West => (north_west, south_west, 0, FLUID_INSET),
                     _ => (south_east, north_east, 0, 1.0 - FLUID_INSET),
                 };
-                if fluid_face_occluded_by_self(state, *dir)
-                    || fluid_face_occluded_by_state(neighbor, *dir, top0.max(top3))
+                if fluid_face_occluded_by_self(block_state_data, *dir)
+                    || fluid_face_occluded_by_state(
+                        block_state_table.block_state_data(neighbor),
+                        *dir,
+                        top0.max(top3),
+                    )
                 {
                     continue;
                 }
@@ -2247,7 +2326,7 @@ fn emit_multipart(
     state: azalea_block::BlockState,
     quads: &[&crate::world::block::model::BakedQuad],
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     bx: i32,
     by: i32,
@@ -2282,19 +2361,24 @@ fn emit_lod_cube(
     block_pos: [f32; 3],
     state: azalea_block::BlockState,
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     bx: i32,
     by: i32,
     bz: i32,
     step: i32,
 ) {
-    let is_fluid = matches!(classify_block(state), BlockKind::Water | BlockKind::Lava);
+    let block_state_table = snapshot.block_state_table;
+    let block_state_data = block_state_table.block_state_data(state);
+    let is_fluid = matches!(
+        classify_block(block_state_data),
+        BlockKind::Water | BlockKind::Lava
+    );
     // We have to do this otherwise there becomes a visible seam at the LOD border
     let fluid_top = if is_fluid {
-        let state_fluid = fluid(state);
+        let state_fluid = block_state_data.fluid();
         let above = snapshot.get_block_state(bx, by + 1, bz);
-        if same_fluid(above, state_fluid.kind) {
+        if same_fluid(block_state_table.block_state_data(above), state_fluid.kind) {
             1.0
         } else {
             state_fluid.height()
@@ -2312,7 +2396,12 @@ fn emit_lod_cube(
         if registry.occludes_neighbor(neighbor) {
             continue;
         }
-        if is_fluid && matches!(classify_block(neighbor), BlockKind::Water | BlockKind::Lava) {
+        if is_fluid
+            && matches!(
+                classify_block(block_state_table.block_state_data(neighbor)),
+                BlockKind::Water | BlockKind::Lava
+            )
+        {
             continue;
         }
 
@@ -2354,7 +2443,7 @@ fn emit_missing_cube(
     sink: &mut MeshSink,
     block_pos: [f32; 3],
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     uv_map: &AtlasUVMap,
     bx: i32,
     by: i32,
@@ -2455,7 +2544,7 @@ fn emit_face_into(
     }
 }
 
-fn shade_brightness(state: azalea_block::BlockState, registry: &BlockRegistry) -> f32 {
+fn shade_brightness(state: azalea_block::BlockState, registry: BlockRenderView<'_>) -> f32 {
     // TODO: non-occluding full cubes (leaves, glass, ice) still darken adjacent
     // faces here. Vanilla's are `isViewBlocking=never` and don't contribute AO.
     if registry.is_opaque_full_cube(state) {
@@ -2490,7 +2579,7 @@ fn corners0_offset(dir: Direction) -> [i32; 3] {
 #[allow(clippy::too_many_arguments)]
 fn compute_face_ao(
     snapshot: &ChunkStoreSnapshot,
-    registry: &BlockRegistry,
+    registry: BlockRenderView<'_>,
     bx: i32,
     by: i32,
     bz: i32,
@@ -2598,7 +2687,7 @@ mod fluid_height_tests {
     use super::{
         average_fluid_corner_height, fluid_face_occluded_by_self, fluid_face_occluded_by_state,
     };
-    use crate::world::block::find_state;
+    use crate::world::block::BlockStateTable;
     use crate::world::block::model::Direction;
 
     #[test]
@@ -2619,11 +2708,19 @@ mod fluid_height_tests {
 
     #[test]
     fn fluid_face_occlusion_matches_vanilla_height_aware_slab_rules() {
-        crate::world::block::init("26.2");
-        let stone = find_state("stone", &[]);
-        let bottom = find_state("oak_slab", &[("type", "bottom"), ("waterlogged", "false")]);
-        let top = find_state("oak_slab", &[("type", "top"), ("waterlogged", "false")]);
-        let occluded = fluid_face_occluded_by_state;
+        let block_state_table = BlockStateTable::native();
+        let stone = block_state_table.find_state("stone", &[]);
+        let bottom = block_state_table
+            .find_state("oak_slab", &[("type", "bottom"), ("waterlogged", "false")]);
+        let top =
+            block_state_table.find_state("oak_slab", &[("type", "top"), ("waterlogged", "false")]);
+        let occluded = |state, direction, height| {
+            fluid_face_occluded_by_state(
+                block_state_table.block_state_data(state),
+                direction,
+                height,
+            )
+        };
 
         // Full blocks hide side faces at any height; a bottom slab only the
         // lower half.
@@ -2643,16 +2740,20 @@ mod fluid_height_tests {
 
     #[test]
     fn partial_occluders_without_face_masks_keep_fluid_faces() {
-        crate::world::block::init("26.2");
+        let block_state_table = BlockStateTable::native();
         for name in ["oak_fence", "cobblestone_wall", "chest"] {
-            let state = find_state(name, &[("waterlogged", "true")]);
+            let state = block_state_table.find_state(name, &[("waterlogged", "true")]);
             for dir in [Direction::North, Direction::South, Direction::Down] {
                 assert!(
-                    !fluid_face_occluded_by_self(state, dir),
+                    !fluid_face_occluded_by_self(block_state_table.block_state_data(state), dir),
                     "{name} hides its own {dir:?} water face"
                 );
                 assert!(
-                    !fluid_face_occluded_by_state(state, dir, 8.0 / 9.0),
+                    !fluid_face_occluded_by_state(
+                        block_state_table.block_state_data(state),
+                        dir,
+                        8.0 / 9.0
+                    ),
                     "{name} hides a neighbor's {dir:?} water face"
                 );
             }
@@ -2695,7 +2796,8 @@ mod terrain_uv_tests {
 #[cfg(test)]
 mod tint_tests {
     use super::{blend_color_with_radius, tint_sample_y};
-    use crate::world::block::registry::Tint;
+    use crate::world::block::BlockStateTable;
+    use crate::world::block::render_assets::Tint;
 
     #[test]
     fn biome_blend_matches_vanilla_integer_channel_division() {
@@ -2708,11 +2810,17 @@ mod tint_tests {
 
     #[test]
     fn double_grass_upper_half_samples_the_lower_block_y() {
-        crate::world::block::init("26.2");
-        let lower = crate::world::block::find_state("tall_grass", &[("half", "lower")]);
-        let upper = crate::world::block::find_state("tall_grass", &[("half", "upper")]);
-        assert_eq!(tint_sample_y(Tint::DoubleGrass, lower, 64), 64);
-        assert_eq!(tint_sample_y(Tint::DoubleGrass, upper, 64), 63);
-        assert_eq!(tint_sample_y(Tint::Grass, upper, 64), 64);
+        let block_state_table = BlockStateTable::native();
+        let lower = block_state_table.find_state("tall_grass", &[("half", "lower")]);
+        let upper = block_state_table.find_state("tall_grass", &[("half", "upper")]);
+        assert_eq!(
+            tint_sample_y(Tint::DoubleGrass, lower, 64, block_state_table),
+            64
+        );
+        assert_eq!(
+            tint_sample_y(Tint::DoubleGrass, upper, 64, block_state_table),
+            63
+        );
+        assert_eq!(tint_sample_y(Tint::Grass, upper, 64, block_state_table), 64);
     }
 }

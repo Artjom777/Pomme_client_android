@@ -21,7 +21,7 @@ use crate::position::{BlockPos, ChunkPos};
 use crate::renderer::pipelines::entity_renderer::{
     ARMOR_SLOTS, ArmorRenderInfo, armor_render_info,
 };
-use crate::world::block::{FluidKind, fluid};
+use crate::world::block::{BlockStateTable, FluidKind};
 use crate::world::chunk::ChunkStore;
 
 /// A scalar synched-entity-data value, forwarded raw from the wire;
@@ -681,7 +681,7 @@ impl LivingEntity {
     /// the (slightly deflated) AABB's block range reaches above the box
     /// bottom. The AABB matches the entity's actual dimensions, including the
     /// baby-squid override and the salmon/pufferfish variant scale.
-    fn probe_water(&self, chunks: &ChunkStore) -> bool {
+    fn probe_water(&self, chunks: &ChunkStore, block_state_table: BlockStateTable) -> bool {
         let (w, h): (f64, f64) = match self.entity_type {
             // `Squid.BABY_DIMENSIONS` is an explicit 0.5x0.5.
             EntityKind::Squid | EntityKind::GlowSquid if self.is_baby => (0.5, 0.5),
@@ -717,12 +717,16 @@ impl LivingEntity {
         for bx in (min_x.floor() as i32)..=(max_x.ceil() as i32 - 1) {
             for by in (min_y.floor() as i32)..=(max_y.ceil() as i32 - 1) {
                 for bz in (min_z.floor() as i32)..=(max_z.ceil() as i32 - 1) {
-                    let f = fluid(chunks.get_block_state(bx, by, bz));
+                    let f = block_state_table
+                        .block_state_data(chunks.get_block_state(bx, by, bz))
+                        .fluid();
                     if f.kind != FluidKind::Water {
                         continue;
                     }
                     // Full height when the block above is also water.
-                    let above = fluid(chunks.get_block_state(bx, by + 1, bz));
+                    let above = block_state_table
+                        .block_state_data(chunks.get_block_state(bx, by + 1, bz))
+                        .fluid();
                     let top = by as f64
                         + if above.kind == FluidKind::Water {
                             1.0
@@ -1021,10 +1025,14 @@ impl ItemEntityStore {
         }
     }
 
-    pub fn tick(&mut self, chunk_store: &ChunkStore) {
+    pub fn tick(
+        &mut self,
+        chunk_store: &ChunkStore,
+        block_state_table: crate::world::block::BlockStateTable,
+    ) {
         for (&id, entity) in self.items.iter_mut() {
             entity.prev_position = entity.position;
-            tick_item_physics(id, entity, chunk_store);
+            tick_item_physics(id, entity, chunk_store, block_state_table);
             entity.age += 1;
         }
         for pickup in &mut self.pickups {
@@ -1075,7 +1083,12 @@ const ITEM_HALF_WIDTH: f64 = 0.125;
 /// Client-side port of `ItemEntity.tick` movement: gravity or fluid drift,
 /// collide-and-slide, friction, then the half-speed landing bounce.
 /// Server-only parts (merging, despawn, pickup delay) are omitted.
-fn tick_item_physics(id: i32, entity: &mut ItemEntity, chunk_store: &ChunkStore) {
+fn tick_item_physics(
+    id: i32,
+    entity: &mut ItemEntity,
+    chunk_store: &ChunkStore,
+    block_state_table: crate::world::block::BlockStateTable,
+) {
     let block_x = entity.position.x.floor() as i32;
     let block_y = entity.position.y.floor() as i32;
     let block_z = entity.position.z.floor() as i32;
@@ -1086,7 +1099,7 @@ fn tick_item_physics(id: i32, entity: &mut ItemEntity, chunk_store: &ChunkStore)
     }
 
     let state = chunk_store.get_block_state(block_x, block_y, block_z);
-    let fluid = fluid(state);
+    let fluid = block_state_table.block_state_data(state).fluid();
     // Vanilla `getFluidHeight(...) > 0.1`: how far the fluid surface sits
     // above the item's feet, sampled at the position block.
     let fluid_height = block_y as f64 + fluid.height() as f64 - entity.position.y;
@@ -1108,7 +1121,7 @@ fn tick_item_physics(id: i32, entity: &mut ItemEntity, chunk_store: &ChunkStore)
     let aabb = Aabb::from_center(entity.position.into(), ITEM_HALF_WIDTH, ITEM_HALF_WIDTH);
     let ctx = CollisionContext::entity(entity.position.y, false, false);
     let (delta, on_ground) = resolve_collision(
-        chunk_store.into(),
+        crate::physics::collision::CollisionWorld::new(chunk_store, block_state_table),
         aabb,
         entity.velocity.into(),
         0.0,
@@ -1478,6 +1491,7 @@ impl EntityStore {
     pub fn tick_living(
         &mut self,
         chunks: &ChunkStore,
+        block_state_table: BlockStateTable,
         player_position: Position,
         local_push_box: Option<Aabb>,
         pusher_allowed: impl Fn(i32, &LivingEntity) -> bool,
@@ -1505,7 +1519,7 @@ impl EntityStore {
                 );
             }
             if probes_water(&entity.entity_type) {
-                entity.is_in_water = entity.probe_water(chunks);
+                entity.is_in_water = entity.probe_water(chunks, block_state_table);
             }
             entity.tick_kind_anims();
             entity.tick_tamable_anims();
@@ -1667,6 +1681,7 @@ mod tests {
     fn tick(store: &mut EntityStore) {
         store.tick_living(
             &ChunkStore::new(2),
+            BlockStateTable::native(),
             Position::default(),
             None,
             |_, _| true,
@@ -1744,6 +1759,7 @@ mod tests {
         // Id 5 stands in for a pusher the caller's pushableBy filter rejects.
         let impulse = store.tick_living(
             &ChunkStore::new(2),
+            BlockStateTable::native(),
             local,
             Some(local_box),
             |id, _| id != 5,

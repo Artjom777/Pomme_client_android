@@ -14,7 +14,7 @@ use crate::assets::{AssetIndex, resolve_asset_path};
 use crate::physics::block_shape::{LocalBox, is_collision_shape_full_block, outline_shape};
 use crate::renderer::camera::CameraUniform;
 use crate::renderer::{MAX_FRAMES_IN_FLIGHT, shader, util};
-use crate::world::block::block_id;
+use crate::world::block::{BlockStateData, BlockStateTable};
 use crate::world::block_entity::is_invisible_block;
 use crate::world::chunk::ChunkStore;
 use crate::world::light::lightmap_brightness;
@@ -37,6 +37,7 @@ pub struct ShadowCaster {
 pub struct ShadowScene<'a> {
     pub casters: &'a [ShadowCaster],
     pub chunks: &'a ChunkStore,
+    pub block_state_table: BlockStateTable,
     pub sky_darken: u8,
     pub ambient_light: f32,
 }
@@ -384,7 +385,9 @@ fn shadow_piece(
     z: i32,
 ) -> Option<(LocalBox, f32)> {
     let power_at_depth = pow - (pos.y - f64::from(y)) as f32 * 0.5;
-    let below = scene.chunks.get_block_state(x, y - 1, z);
+    let below = scene
+        .block_state_table
+        .block_state_data(scene.chunks.get_block_state(x, y - 1, z));
     if !takes_a_shadow(below) {
         return None;
     }
@@ -401,8 +404,8 @@ fn shadow_piece(
 }
 
 /// Whether a shadow can lie on `state`: it renders, and fills its cell.
-fn takes_a_shadow(state: azalea_block::BlockState) -> bool {
-    !is_invisible_block(block_id(state)) && is_collision_shape_full_block(state)
+fn takes_a_shadow(block_state_data: &BlockStateData) -> bool {
+    !is_invisible_block(block_state_data.id()) && is_collision_shape_full_block(block_state_data)
 }
 
 /// Vanilla `ShadowFeatureRenderer`: the piece's quad, `rel` from the caster
@@ -643,11 +646,10 @@ fn create_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::block::find_state;
 
     #[test]
     fn shadows_land_only_on_full_visible_blocks() {
-        crate::world::block::init("26.2");
+        let blocks = BlockStateTable::native();
         for (name, props, expected) in [
             ("stone", &[][..], true),
             ("grass_block", &[("snowy", "false")][..], true),
@@ -666,7 +668,7 @@ mod tests {
             ("water", &[("level", "0")][..], false),
         ] {
             assert_eq!(
-                takes_a_shadow(find_state(name, props)),
+                takes_a_shadow(blocks.block_state_data(blocks.find_state(name, props))),
                 expected,
                 "{name} {props:?}"
             );

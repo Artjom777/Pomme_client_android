@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use glam::{Mat3, Mat4, Quat, Vec3};
 use serde::Deserialize;
 
-use super::registry::{FaceTextures, Tint};
+use super::render_assets::{FaceTextures, Tint};
 use crate::assets::{AssetId, AssetIndex, resolve_asset_path_with_packs};
 use crate::renderer::chunk::mesher::Colormap;
 
@@ -427,7 +427,7 @@ pub struct BakedQuad {
     pub uvs: [[f32; 2]; 4],
     pub texture: String,
     pub cullface: Option<Direction>,
-    pub tint: super::registry::Tint,
+    pub tint: super::render_assets::Tint,
     /// Raw vanilla face `tintindex`. Terrain resolves this through `tint`,
     /// while item models use it to index the `ItemTintSource` palette from
     /// their item definition.
@@ -1159,7 +1159,7 @@ fn add_chest_cube(
                 .map(|[u_px, v_px]| [u_px / TEX_SIZE, v_px / TEX_SIZE]),
             texture: texture.to_string(),
             cullface: None,
-            tint: super::registry::Tint::None,
+            tint: super::render_assets::Tint::None,
             tint_index: None,
             shade_light: spec.shade,
             shade_face: None,
@@ -1734,7 +1734,7 @@ fn bake_resolved_model(
     resolved: &ResolvedModel,
     rot_x: i32,
     rot_y: i32,
-    tint: super::registry::Tint,
+    tint: super::render_assets::Tint,
 ) -> Option<BakedModel> {
     if resolved.elements.is_empty() {
         return None;
@@ -1776,7 +1776,7 @@ fn bake_resolved_model(
             let quad_tint = if face_def.tint_index.is_some() {
                 tint
             } else {
-                super::registry::Tint::None
+                super::render_assets::Tint::None
             };
 
             if rot_x != 0 || rot_y != 0 {

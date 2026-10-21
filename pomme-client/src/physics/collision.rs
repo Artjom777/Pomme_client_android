@@ -6,10 +6,7 @@ use super::block_shape::{self, CollisionContext};
 use crate::entity::components::Velocity;
 use crate::position::BlockPos;
 use crate::world::block::model::Direction;
-use crate::world::block::{
-    SpecialCollision, block_properties, collision_shape_position, has_large_collision_shape,
-    special_collision, with_property,
-};
+use crate::world::block::{BlockStateTable, SpecialCollision};
 use crate::world::block_entity_anim::BlockEntityAnimStore;
 use crate::world::chunk::ChunkStore;
 use crate::world::piston;
@@ -18,6 +15,7 @@ use crate::world::piston;
 #[derive(Clone, Copy)]
 pub struct CollisionWorld<'a> {
     pub chunks: &'a ChunkStore,
+    pub block_state_table: BlockStateTable,
     /// Shulker lids follow their open animation and moving pistons their
     /// blocks; `None` keeps lids closed and moving pistons empty.
     pub block_entity_anim: Option<&'a BlockEntityAnimStore>,
@@ -26,12 +24,25 @@ pub struct CollisionWorld<'a> {
     pub piston_noclip: Option<Direction>,
 }
 
-impl<'a> From<&'a ChunkStore> for CollisionWorld<'a> {
-    fn from(chunks: &'a ChunkStore) -> Self {
+impl<'a> CollisionWorld<'a> {
+    pub fn new(chunks: &'a ChunkStore, block_state_table: BlockStateTable) -> Self {
         Self {
             chunks,
+            block_state_table,
             block_entity_anim: None,
             piston_noclip: None,
+        }
+    }
+
+    /// With the block entities shulker lids and moving pistons collide by.
+    pub fn with_block_entities(
+        chunks: &'a ChunkStore,
+        block_state_table: BlockStateTable,
+        block_entity_anim: &'a BlockEntityAnimStore,
+    ) -> Self {
+        Self {
+            block_entity_anim: Some(block_entity_anim),
+            ..Self::new(chunks, block_state_table)
         }
     }
 }
@@ -40,7 +51,8 @@ impl CollisionWorld<'_> {
     /// `ShulkerBoxBlockEntity.getBoundingBox` moved to `pos`; `None` while
     /// closed, where the static full cube applies.
     fn shulker_lid(&self, state: BlockState, pos: BlockPos) -> Option<Aabb> {
-        if special_collision(state) != SpecialCollision::ShulkerBox {
+        let block_state_data = self.block_state_table.block_state_data(state);
+        if block_state_data.special_collision() != SpecialCollision::ShulkerBox {
             return None;
         }
         let extension = f64::from(0.5 * self.block_entity_anim?.container(&pos)?.openness(1.0));
@@ -48,7 +60,7 @@ impl CollisionWorld<'_> {
             return None;
         }
         let mut local = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        match block_properties(state).get("facing").unwrap_or("up") {
+        match block_state_data.properties().get("facing").unwrap_or("up") {
             "down" => local[1] -= extension,
             "up" => local[4] += extension,
             "north" => local[2] -= extension,
@@ -59,7 +71,7 @@ impl CollisionWorld<'_> {
         }
         Some(Aabb::from_local(
             local,
-            collision_shape_position(state, pos.x, pos.y, pos.z),
+            block_state_data.collision_shape_position(pos.x, pos.y, pos.z),
         ))
     }
 
@@ -74,22 +86,25 @@ impl CollisionWorld<'_> {
         else {
             return;
         };
+        let blocks = self.block_state_table;
         let empty = &CollisionContext::EMPTY;
         let moved = piston.moved_state;
-        if !piston.extending && piston.source && piston::is_piston_base(moved) {
-            let base = with_property(moved, "extended", "true").unwrap_or(moved);
-            state_boxes(base, pos, empty, DVec3::ZERO, boxes);
+        if !piston.extending && piston.source && piston::is_piston_base(blocks, moved) {
+            let base = blocks
+                .with_property(moved, "extended", "true")
+                .unwrap_or(moved);
+            state_boxes(blocks, base, pos, empty, DVec3::ZERO, boxes);
         }
         if piston.progress < 1.0 && self.piston_noclip == Some(piston.movement_direction()) {
             return;
         }
         let state = if piston.source {
             let short = piston.extending != (1.0 - piston.progress < 0.25);
-            piston::piston_head(piston.direction, false, short)
+            piston::piston_head(blocks, piston.direction, false, short)
         } else {
             moved
         };
-        state_boxes(state, pos, empty, piston.extension(), boxes);
+        state_boxes(blocks, state, pos, empty, piston.extension(), boxes);
     }
 
     /// Shapes that come from block entity state rather than the block table;
@@ -99,7 +114,12 @@ impl CollisionWorld<'_> {
             boxes.push(lid);
             return true;
         }
-        if special_collision(state) == SpecialCollision::MovingPiston {
+        if self
+            .block_state_table
+            .block_state_data(state)
+            .special_collision()
+            == SpecialCollision::MovingPiston
+        {
             self.moving_piston(pos, boxes);
             return true;
         }
@@ -113,6 +133,7 @@ impl CollisionWorld<'_> {
         visit: impl FnMut(BlockPos, &[Aabb]),
     ) {
         for_each_block_collision(
+            self.block_state_table,
             region,
             ctx,
             |x, y, z| self.chunks.get_block_state(x, y, z),
@@ -124,15 +145,17 @@ impl CollisionWorld<'_> {
 
 /// `state`'s collision boxes at `pos`, moved by `offset`.
 pub(crate) fn state_boxes(
+    block_state_table: BlockStateTable,
     state: BlockState,
     pos: BlockPos,
     ctx: &CollisionContext,
     offset: DVec3,
     boxes: &mut Vec<Aabb>,
 ) {
-    match block_shape::collision_shape(state, pos.y, ctx) {
+    let block_state_data = block_state_table.block_state_data(state);
+    match block_shape::collision_shape(block_state_data, pos.y, ctx) {
         Some(local) => {
-            let base = collision_shape_position(state, pos.x, pos.y, pos.z) + offset;
+            let base = block_state_data.collision_shape_position(pos.x, pos.y, pos.z) + offset;
             boxes.extend(local.iter().map(|&b| Aabb::from_local(b, base)));
         }
         None => boxes.push(Aabb::block(pos.x, pos.y, pos.z).offset(offset)),
@@ -144,6 +167,7 @@ pub(crate) fn state_boxes(
 /// padding shell, and visits each block whose shape intersects the region
 /// with that whole shape.
 fn for_each_block_collision(
+    block_state_table: BlockStateTable,
     region: &Aabb,
     ctx: &CollisionContext,
     state_at: impl Fn(i32, i32, i32) -> BlockState,
@@ -167,15 +191,17 @@ fn for_each_block_collision(
                     continue;
                 }
                 let state = state_at(bx, by, bz);
-                if shell_axes == 1 && !has_large_collision_shape(state)
-                    || shell_axes == 2 && special_collision(state) != SpecialCollision::MovingPiston
+                let block_state_data = block_state_table.block_state_data(state);
+                if shell_axes == 1 && !block_state_data.has_large_collision_shape()
+                    || shell_axes == 2
+                        && block_state_data.special_collision() != SpecialCollision::MovingPiston
                 {
                     continue;
                 }
                 let pos = BlockPos::new(bx, by, bz);
                 boxes.clear();
                 if !special_boxes(state, pos, &mut boxes) {
-                    state_boxes(state, pos, ctx, DVec3::ZERO, &mut boxes);
+                    state_boxes(block_state_table, state, pos, ctx, DVec3::ZERO, &mut boxes);
                 }
                 if boxes.iter().any(|b| b.intersects(region)) {
                     visit(pos, &boxes);
@@ -362,7 +388,6 @@ pub fn resolve_collision(
 mod tests {
     use super::*;
     use crate::player::PLAYER_HALF_WIDTH;
-    use crate::world::block::{find_state, has_collision};
 
     /// Boxes near a player moving down from `feet`, with `state` at the
     /// origin and air elsewhere.
@@ -373,6 +398,7 @@ mod tests {
         );
         let mut aabbs = Vec::new();
         for_each_block_collision(
+            BlockStateTable::native(),
             &region,
             ctx,
             |x, y, z| {
@@ -390,8 +416,7 @@ mod tests {
 
     #[test]
     fn fence_top_is_found_from_the_cell_above() {
-        crate::world::block::init("26.2");
-        let fence = find_state("oak_fence", &[]);
+        let fence = BlockStateTable::native().find_state("oak_fence", &[]);
         let feet = dvec3(0.5, 1.55, 0.5);
         let ctx = CollisionContext::entity(feet.y, false, false);
         let boxes = boxes_near(fence, feet, &ctx);
@@ -400,8 +425,8 @@ mod tests {
 
     #[test]
     fn scaffolding_is_solid_only_from_above() {
-        crate::world::block::init("26.2");
-        let scaffolding = find_state("scaffolding", &[("bottom", "false"), ("distance", "0")]);
+        let scaffolding = BlockStateTable::native()
+            .find_state("scaffolding", &[("bottom", "false"), ("distance", "0")]);
         let top = dvec3(0.5, 1.0, 0.5);
         let inside = dvec3(0.5, 0.5, 0.5);
         let standing = CollisionContext::entity(top.y, false, false);
@@ -418,17 +443,20 @@ mod tests {
 
     #[test]
     fn unstable_scaffolding_keeps_its_bottom_plate() {
-        crate::world::block::init("26.2");
-        let scaffolding = find_state("scaffolding", &[("bottom", "true"), ("distance", "3")]);
+        let scaffolding = BlockStateTable::native()
+            .find_state("scaffolding", &[("bottom", "true"), ("distance", "3")]);
         let ctx = CollisionContext::entity(0.5, false, false);
-        let boxes = block_shape::collision_shape(scaffolding, 0, &ctx);
+        let boxes = block_shape::collision_shape(
+            BlockStateTable::native().block_state_data(scaffolding),
+            0,
+            &ctx,
+        );
         assert_eq!(boxes, Some(&[[0.0, 0.0, 0.0, 1.0, 2.0 / 16.0, 1.0]][..]));
     }
 
     #[test]
     fn powder_snow_holds_only_leather_boots() {
-        crate::world::block::init("26.2");
-        let snow = find_state("powder_snow", &[]);
+        let snow = BlockStateTable::native().find_state("powder_snow", &[]);
         let feet = dvec3(0.5, 1.0, 0.5);
         let boots = CollisionContext::entity(feet.y, false, true);
         assert!(!boxes_near(snow, feet, &boots).is_empty());
@@ -439,53 +467,75 @@ mod tests {
 
     #[test]
     fn powder_snow_catches_a_long_fall() {
-        crate::world::block::init("26.2");
-        let snow = find_state("powder_snow", &[]);
+        let snow = BlockStateTable::native().find_state("powder_snow", &[]);
         let falling = CollisionContext::entity(0.5, true, false).with_fall_distance(2.500_001);
-        let boxes = block_shape::collision_shape(snow, 0, &falling);
+        let boxes = block_shape::collision_shape(
+            BlockStateTable::native().block_state_data(snow),
+            0,
+            &falling,
+        );
         assert_eq!(
             boxes,
             Some(&[[0.0, 0.0, 0.0, 1.0, 0.9_f32 as f64, 1.0]][..])
         );
         let short = CollisionContext::entity(0.5, true, false).with_fall_distance(2.5);
-        assert_eq!(block_shape::collision_shape(snow, 0, &short), Some(&[][..]));
+        assert_eq!(
+            block_shape::collision_shape(
+                BlockStateTable::native().block_state_data(snow),
+                0,
+                &short
+            ),
+            Some(&[][..])
+        );
     }
 
     #[test]
     fn explicit_collision_overrides_survive_no_collision_registration() {
-        crate::world::block::init("26.2");
         let ctx = CollisionContext::entity(0.0, false, false);
 
-        let pitcher = find_state("pitcher_crop", &[("age", "0"), ("half", "lower")]);
-        assert!(!has_collision(pitcher));
-        let pitcher_shape = block_shape::collision_shape(pitcher, 0, &ctx).unwrap();
+        let pitcher = BlockStateTable::native()
+            .find_state("pitcher_crop", &[("age", "0"), ("half", "lower")]);
+        assert!(
+            !BlockStateTable::native()
+                .block_state_data(pitcher)
+                .has_collision()
+        );
+        let pitcher_shape = block_shape::collision_shape(
+            BlockStateTable::native().block_state_data(pitcher),
+            0,
+            &ctx,
+        )
+        .unwrap();
         assert!(!pitcher_shape.is_empty());
 
-        let wall_sign = find_state(
+        let wall_sign = BlockStateTable::native().find_state(
             "oak_wall_hanging_sign",
             &[("facing", "north"), ("waterlogged", "false")],
         );
-        assert!(!has_collision(wall_sign));
+        assert!(
+            !BlockStateTable::native()
+                .block_state_data(wall_sign)
+                .has_collision()
+        );
         assert_eq!(
-            block_shape::collision_shape(wall_sign, 0, &ctx),
+            block_shape::collision_shape(
+                BlockStateTable::native().block_state_data(wall_sign),
+                0,
+                &ctx
+            ),
             Some(&[[0.0, 0.875, 0.375, 1.0, 1.0, 0.625]][..])
         );
     }
 
     #[test]
     fn shulker_collision_uses_current_block_entity_open_progress() {
-        crate::world::block::init("26.2");
-        let state = find_state("shulker_box", &[("facing", "east")]);
+        let state = BlockStateTable::native().find_state("shulker_box", &[("facing", "east")]);
         let pos = BlockPos::new(10, 64, -3);
         let mut anim = BlockEntityAnimStore::default();
         anim.set_open_count(pos, 1);
         anim.tick();
         let chunks = ChunkStore::new(2);
-        let world = CollisionWorld {
-            chunks: &chunks,
-            block_entity_anim: Some(&anim),
-            piston_noclip: None,
-        };
+        let world = CollisionWorld::with_block_entities(&chunks, BlockStateTable::native(), &anim);
 
         let aabb = world.shulker_lid(state, pos).unwrap();
         assert_eq!(aabb.min, dvec3(10.0, 64.0, -3.0));
@@ -494,7 +544,7 @@ mod tests {
         assert_eq!(aabb.max.y, 65.0);
         assert_eq!(aabb.max.z, -2.0);
         assert!(
-            CollisionWorld::from(&chunks)
+            CollisionWorld::new(&chunks, BlockStateTable::native())
                 .shulker_lid(state, pos)
                 .is_none()
         );
@@ -531,20 +581,17 @@ mod tests {
     fn moving_pistons_collide_where_their_block_has_got_to() {
         use crate::world::block::model::Direction;
         use crate::world::piston::MovingPiston;
-        crate::world::block::init("26.2");
         let pos = BlockPos::new(4, 64, 4);
-        let moving = find_state("moving_piston", &[("facing", "east"), ("type", "normal")]);
-        let stone = find_state("stone", &[]);
+        let moving = BlockStateTable::native()
+            .find_state("moving_piston", &[("facing", "east"), ("type", "normal")]);
+        let stone = BlockStateTable::native().find_state("stone", &[]);
         let mut anim = BlockEntityAnimStore::default();
         let mut piston = MovingPiston::new(stone, Direction::East, true, false);
         piston.progress = 0.5;
         anim.pistons.insert(pos, piston);
         let chunks = ChunkStore::new(2);
-        let mut world = CollisionWorld {
-            chunks: &chunks,
-            block_entity_anim: Some(&anim),
-            piston_noclip: None,
-        };
+        let mut world =
+            CollisionWorld::with_block_entities(&chunks, BlockStateTable::native(), &anim);
         let boxes = |world: &CollisionWorld| {
             let mut boxes = Vec::new();
             assert!(world.special_boxes(moving, pos, &mut boxes));
@@ -560,7 +607,8 @@ mod tests {
         world.piston_noclip = None;
 
         // A retracting piston: its extended base, and the head on its way in.
-        let base = find_state("piston", &[("facing", "east"), ("extended", "false")]);
+        let base = BlockStateTable::native()
+            .find_state("piston", &[("facing", "east"), ("extended", "false")]);
         let mut retracting = MovingPiston::new(base, Direction::East, false, true);
         retracting.progress = 0.5;
         let mut retract_anim = BlockEntityAnimStore::default();

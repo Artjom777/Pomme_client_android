@@ -61,7 +61,9 @@ use crate::position::{BlockPos, ChunkPos};
 use crate::renderer::pipelines::chunk_borders::ChunkBorderPipeline;
 use crate::renderer::pipelines::item_entity::ItemEntityPipeline;
 use crate::ui::font::{FontOptions, FontSources};
-use crate::world::block::registry::BlockRegistry;
+use crate::world::block::render_assets::{
+    BlockRenderAssets, BlockRenderView, OwnedBlockRenderView,
+};
 
 #[derive(Error, Debug)]
 pub enum RendererError {
@@ -116,6 +118,7 @@ fn preview_box_rect(rect: [f32; 4], extent: vk::Extent2D) -> Option<vk::Rect2D> 
 #[allow(clippy::large_enum_variant)]
 enum RenderMode<'a> {
     World {
+        block_render: BlockRenderView<'a>,
         overlay: Vec<MenuElement>,
         swing_progress: f32,
         use_anim: Option<pipelines::held_item::UseAnim>,
@@ -163,7 +166,7 @@ pub struct Renderer {
     swapchain: Swapchain,
     camera: Camera,
 
-    registry: BlockRegistry,
+    render_assets: Arc<BlockRenderAssets>,
     jar_assets_dir: PathBuf,
     asset_index: Option<AssetIndex>,
 
@@ -223,12 +226,12 @@ impl Renderer {
             packs,
             options: font_options,
         } = font_sources;
-        let registry_handle = {
+        let render_assets_handle = {
             let jar_assets_dir = jar_assets_dir.to_path_buf();
             let asset_index = asset_index.clone();
             let cache_dir = cache_dir.to_path_buf();
             std::thread::spawn(move || {
-                BlockRegistry::load(&jar_assets_dir, &asset_index, Some(&cache_dir), None)
+                BlockRenderAssets::load(&jar_assets_dir, &asset_index, Some(&cache_dir), None)
             })
         };
 
@@ -248,13 +251,16 @@ impl Renderer {
         splash(&mut menu_pipeline, 0.0, "Loading block models...");
 
         let camera = Camera::new(swapchain_state.aspect_ratio());
-        let registry = registry_handle
-            .join()
-            .expect("block registry thread panicked");
+        let render_assets = Arc::new(
+            render_assets_handle
+                .join()
+                .expect("block render assets thread panicked"),
+        );
 
         splash(&mut menu_pipeline, 0.2, "Building texture atlas...");
 
-        let (texture_names, generated_item_textures) = chunk::atlas::atlas_texture_names(&registry);
+        let (texture_names, generated_item_textures) =
+            chunk::atlas::atlas_texture_names(&render_assets);
         let atlas = TextureAtlas::build(
             &ctx.device,
             ctx.graphics_queue,
@@ -473,14 +479,14 @@ impl Renderer {
             &ctx.allocator,
             &mut item_entity_pipeline,
             &atlas.uv_map,
-            &registry,
+            &render_assets,
         );
 
         Ok(Self {
             ctx,
             swapchain: swapchain_state,
             camera,
-            registry,
+            render_assets,
             jar_assets_dir: jar_assets_dir.to_path_buf(),
             asset_index: asset_index.clone(),
             atlas,
@@ -930,6 +936,7 @@ impl Renderer {
 
     pub fn update_third_person_distance(
         &mut self,
+        block_render: BlockRenderView<'_>,
         eye_pos: Position,
         chunks: &crate::world::chunk::ChunkStore,
         max_distance: f32,
@@ -973,7 +980,7 @@ impl Renderer {
                     check.y.floor() as i32,
                     check.z.floor() as i32,
                 );
-                self.registry.is_opaque_full_cube(state)
+                block_render.is_opaque_full_cube(state)
             });
             if hit {
                 dist = (t - 0.3).max(0.5);
@@ -1148,16 +1155,22 @@ impl Renderer {
         self.chunk_buffers.clear();
     }
 
-    pub fn registry(&self) -> &BlockRegistry {
-        &self.registry
+    pub fn render_assets(&self) -> &BlockRenderAssets {
+        &self.render_assets
+    }
+
+    pub(crate) fn shared_render_assets(&self) -> Arc<BlockRenderAssets> {
+        Arc::clone(&self.render_assets)
     }
 
     pub fn atlas_uv_map(&self) -> &crate::renderer::chunk::atlas::AtlasUVMap {
         &self.atlas.uv_map
     }
 
+    /// The session view must use the CPU assets loaded with the current atlas.
     pub fn create_mesh_dispatcher(
         &self,
+        render_view: OwnedBlockRenderView,
         biome_climate: std::sync::Arc<
             std::collections::HashMap<u32, crate::renderer::chunk::mesher::BiomeClimate>,
         >,
@@ -1165,7 +1178,7 @@ impl Renderer {
         cardinal_light: crate::world::block::model::CardinalLightType,
     ) -> MeshDispatcher {
         MeshDispatcher::load(
-            self.registry.clone(),
+            render_view,
             self.atlas.uv_map.clone(),
             &self.jar_assets_dir,
             &self.asset_index,
@@ -1187,6 +1200,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     pub fn render_world(
         &mut self,
+        block_render: BlockRenderView<'_>,
         window: &Window,
         hide_cursor: bool,
         overlay: Vec<MenuElement>,
@@ -1215,7 +1229,7 @@ impl Renderer {
         self.camera.set_render_distance(render_distance);
         let held_item = held_item.map(|(name, light, stack)| {
             let item_tints =
-                self.registry
+                self.render_assets
                     .item_tint_palette(&name, Some(&stack), player_team_color);
             let has_3d_model = self.ensure_item_mesh(&name).is_block_model;
             pipelines::held_item::HeldItemInfo {
@@ -1239,6 +1253,7 @@ impl Renderer {
             hide_cursor,
             [clear_col[0], clear_col[1], clear_col[2], 1.0],
             RenderMode::World {
+                block_render,
                 overlay,
                 swing_progress,
                 use_anim,
@@ -1294,14 +1309,18 @@ impl Renderer {
     ) {
         self.ctx.device.wait_idle().unwrap();
 
-        self.registry =
-            BlockRegistry::load(&self.jar_assets_dir, &self.asset_index, None, Some(packs));
+        self.render_assets = Arc::new(BlockRenderAssets::load(
+            &self.jar_assets_dir,
+            &self.asset_index,
+            None,
+            Some(packs),
+        ));
 
         self.item_entity_pipeline
             .clear_meshes(&self.ctx.device, &self.ctx.allocator);
         self.atlas.destroy(&self.ctx.device, &self.ctx.allocator);
         let (texture_names, generated_item_textures) =
-            chunk::atlas::atlas_texture_names(&self.registry);
+            chunk::atlas::atlas_texture_names(&self.render_assets);
         self.atlas = TextureAtlas::build(
             &self.ctx.device,
             self.ctx.graphics_queue,
@@ -1342,7 +1361,7 @@ impl Renderer {
             &self.ctx.allocator,
             &mut self.item_entity_pipeline,
             &self.atlas.uv_map,
-            &self.registry,
+            &self.render_assets,
         );
 
         // GUI item slots cache fully rendered pixels. Releasing their keys is
@@ -1497,7 +1516,7 @@ impl Renderer {
         if let Some(info) = self.item_entity_pipeline.mesh_info(name) {
             return info;
         }
-        let is_block_model = if let Some(model) = self.registry.get_item_model(name) {
+        let is_block_model = if let Some(model) = self.render_assets.get_item_model(name) {
             self.item_entity_pipeline.ensure_mesh(
                 &self.ctx.device,
                 &self.ctx.allocator,
@@ -1511,7 +1530,7 @@ impl Renderer {
                 &self.ctx.device,
                 &self.ctx.allocator,
                 name,
-                &self.registry.flat_item_layers(name),
+                &self.render_assets.flat_item_layers(name),
                 &self.atlas.uv_map,
             );
             false
@@ -1694,7 +1713,7 @@ impl Renderer {
                     } else {
                         None
                     };
-                    *item_tints = self.registry.item_tint_palette(
+                    *item_tints = self.render_assets.item_tint_palette(
                         item_name,
                         item_stack.as_ref(),
                         owner_team_color,
@@ -1713,7 +1732,7 @@ impl Renderer {
                                 return Vec::new();
                             };
                             let name = crate::player::inventory::item_resource_name(data.kind);
-                            let tints = self.registry.item_tint_palette(
+                            let tints = self.render_assets.item_tint_palette(
                                 &name,
                                 Some(data),
                                 player_team_color,
@@ -1780,7 +1799,7 @@ impl Renderer {
                         slot,
                         name: name.clone(),
                         item_tints: item_tints.clone(),
-                        display: self.registry.get_item_gui_transform(name),
+                        display: self.render_assets.get_item_gui_transform(name),
                         needs_clear: matches!(state, pipelines::gui_item_atlas::SlotState::Stale),
                     });
                 }
@@ -1855,6 +1874,7 @@ impl Renderer {
 
         match &mode {
             RenderMode::World {
+                block_render,
                 overlay,
                 swing_progress,
                 use_anim,
@@ -1914,7 +1934,7 @@ impl Renderer {
                     self.block_overlay_pipeline.draw(
                         cmd,
                         frame,
-                        &self.registry,
+                        *block_render,
                         *state,
                         block_pos,
                         anchor,
@@ -2269,17 +2289,17 @@ fn warm_item_meshes(
     allocator: &Arc<std::sync::Mutex<pomme_gpu_allocator::vulkan::Allocator>>,
     item_entity_pipeline: &mut ItemEntityPipeline,
     uv_map: &chunk::atlas::AtlasUVMap,
-    registry: &BlockRegistry,
+    render_assets: &BlockRenderAssets,
 ) {
-    for name in registry.item_names() {
-        if let Some(model) = registry.get_item_model(name) {
+    for name in render_assets.item_names() {
+        if let Some(model) = render_assets.get_item_model(name) {
             item_entity_pipeline.ensure_mesh(device, allocator, name, model, uv_map);
         } else {
             item_entity_pipeline.ensure_flat_mesh(
                 device,
                 allocator,
                 name,
-                &registry.flat_item_layers(name),
+                &render_assets.flat_item_layers(name),
                 uv_map,
             );
         }

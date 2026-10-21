@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 const BLOCK_CACHE_FILE: &str = "block_cache_v4.json";
 
+use super::block_state_table::BlockStateTable;
 use super::model;
 use super::model::BakedModel;
 use crate::assets::AssetIndex;
@@ -89,14 +90,14 @@ struct StateRender {
     hidden_when_enclosed: bool,
 }
 
-#[derive(Clone)]
-pub struct BlockRegistry {
+#[derive(Default)]
+pub struct BlockRenderAssets {
     textures: HashMap<String, FaceTextures>,
     baked: HashMap<String, HashMap<String, Arc<BakedModel>>>,
     /// Per block-state table slot, every state's resolved model lookups,
     /// indexed by state id; built on first use of the slot. The mesher queries
     /// these for every block and neighbour, so they must not hash or parse.
-    state_render: Arc<[OnceLock<Box<[StateRender]>>; super::TABLE_SLOTS]>,
+    state_render: [OnceLock<Box<[StateRender]>>; super::TABLE_SLOTS],
     multipart: HashMap<String, Vec<model::MultipartEntry>>,
     item_models: HashMap<String, BakedModel>,
     flat_item_textures: std::collections::HashSet<String>,
@@ -106,7 +107,41 @@ pub struct BlockRegistry {
     item_tint_sources: HashMap<String, Vec<model::ItemTintSource>>,
 }
 
-impl BlockRegistry {
+/// Lightweight view of CPU assets paired with the session's explicitly selected
+/// state table.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockRenderView<'a> {
+    assets: &'a BlockRenderAssets,
+    block_state_table: BlockStateTable,
+}
+
+/// Owned, lightweight view of CPU-asset and state-table snapshot for deferred
+/// rendering work. Cloning shares the assets; queries borrow the existing
+/// render view.
+#[derive(Clone)]
+pub(crate) struct OwnedBlockRenderView {
+    assets: Arc<BlockRenderAssets>,
+    block_state_table: BlockStateTable,
+}
+
+impl OwnedBlockRenderView {
+    pub(crate) fn block_state_table(&self) -> BlockStateTable {
+        self.block_state_table
+    }
+
+    pub(crate) fn new(assets: Arc<BlockRenderAssets>, block_state_table: BlockStateTable) -> Self {
+        Self {
+            assets,
+            block_state_table,
+        }
+    }
+
+    pub(crate) fn as_view(&self) -> BlockRenderView<'_> {
+        self.assets.for_version(self.block_state_table)
+    }
+}
+
+impl BlockRenderAssets {
     pub fn load(
         jar_assets_dir: &Path,
         asset_index: &Option<AssetIndex>,
@@ -121,7 +156,10 @@ impl BlockRegistry {
 
         let textures = cache_path.as_deref().and_then(load_cache);
         if let Some(cached) = &textures {
-            tracing::info!("Block registry: {} blocks (cached textures)", cached.len());
+            tracing::info!(
+                "Block render assets: {} blocks (cached textures)",
+                cached.len()
+            );
         }
 
         let textures = textures.unwrap_or_else(|| {
@@ -137,7 +175,7 @@ impl BlockRegistry {
             if let Some(path) = &cache_path {
                 save_cache(path, &textures);
             }
-            tracing::info!("Block registry: {} blocks (built)", textures.len());
+            tracing::info!("Block render assets: {} blocks (built)", textures.len());
             textures
         });
 
@@ -163,7 +201,7 @@ impl BlockRegistry {
         Self {
             textures,
             baked,
-            state_render: Arc::new([const { OnceLock::new() }; super::TABLE_SLOTS]),
+            state_render: [const { OnceLock::new() }; super::TABLE_SLOTS],
             multipart,
             item_models,
             flat_item_textures,
@@ -171,6 +209,13 @@ impl BlockRegistry {
             item_gui_transforms,
             item_ground_transforms,
             item_tint_sources,
+        }
+    }
+
+    pub(crate) fn for_version(&self, block_state_table: BlockStateTable) -> BlockRenderView<'_> {
+        BlockRenderView {
+            assets: self,
+            block_state_table,
         }
     }
 
@@ -230,24 +275,24 @@ impl BlockRegistry {
         self.item_ground_transforms.get(name).copied()
     }
 
-    pub fn get_textures(&self, state: BlockState) -> Option<&FaceTextures> {
-        self.textures.get(super::block_id(state))
-    }
-
-    pub fn get_baked_model(&self, state: BlockState) -> Option<&BakedModel> {
-        self.state_render(state)?.model.as_deref()
-    }
-
-    fn state_render(&self, state: BlockState) -> Option<&StateRender> {
-        let slot = super::active_table_slot();
+    fn state_render(
+        &self,
+        block_state_table: BlockStateTable,
+        state: BlockState,
+    ) -> Option<&StateRender> {
+        let slot = block_state_table.table_slot();
         self.state_render[slot]
             .get_or_init(|| {
-                super::states_in_slot(slot)
-                    .map(|info| {
-                        let model = self.resolve_model(info.id, info.properties).cloned();
-                        let opaque_full_cube =
-                            !info.is_air && model.as_ref().is_some_and(|m| m.is_full_cube);
-                        let occludes = opaque_full_cube && info.can_occlude;
+                block_state_table
+                    .table()
+                    .iter()
+                    .map(|block_state_data| {
+                        let model = self
+                            .resolve_model(block_state_data.id, &block_state_data.properties)
+                            .cloned();
+                        let opaque_full_cube = !block_state_data.is_air
+                            && model.as_ref().is_some_and(|m| m.is_full_cube);
+                        let occludes = opaque_full_cube && block_state_data.light.can_occlude;
                         let all_quads_cull = model
                             .as_ref()
                             .is_some_and(|m| m.quads.iter().all(|q| q.cullface.is_some()));
@@ -255,7 +300,9 @@ impl BlockRegistry {
                             model,
                             opaque_full_cube,
                             occludes,
-                            hidden_when_enclosed: occludes && all_quads_cull && !info.has_fluid,
+                            hidden_when_enclosed: occludes
+                                && all_quads_cull
+                                && matches!(block_state_data.fluid.kind, super::FluidKind::Empty),
                         }
                     })
                     .collect()
@@ -280,38 +327,6 @@ impl BlockRegistry {
             })
             .map(|(_, model)| model)
             .or_else(|| variants.values().next())
-    }
-
-    pub fn get_multipart_quads(&self, state: BlockState) -> Option<Vec<&model::BakedQuad>> {
-        let entries = self.multipart.get(super::block_id(state))?;
-        let props = super::block_properties(state);
-
-        let mut quads = Vec::new();
-        for entry in entries {
-            let when = entry.when.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-            if constraints_match(props, when) {
-                quads.extend(entry.quads.iter());
-            }
-        }
-
-        if quads.is_empty() { None } else { Some(quads) }
-    }
-
-    pub fn is_opaque_full_cube(&self, state: BlockState) -> bool {
-        self.state_render(state).is_some_and(|r| r.opaque_full_cube)
-    }
-
-    /// Whether `state` culls a neighbor's adjacent face: a full cube that can
-    /// occlude, so `noOcclusion` cubes like glass and leaves don't.
-    pub fn occludes_neighbor(&self, state: BlockState) -> bool {
-        self.state_render(state).is_some_and(|r| r.occludes)
-    }
-
-    /// Whether `state` emits no geometry once all six neighbours occlude: a
-    /// non-fluid occluder whose every quad has a cullface.
-    pub fn hidden_when_enclosed(&self, state: BlockState) -> bool {
-        self.state_render(state)
-            .is_some_and(|r| r.hidden_when_enclosed)
     }
 
     pub fn texture_names(&self) -> impl Iterator<Item = &str> + '_ {
@@ -345,6 +360,62 @@ impl BlockRegistry {
             .chain(baked_textures)
             .chain(multipart_textures)
             .chain(item_model_textures)
+    }
+}
+
+impl<'a> BlockRenderView<'a> {
+    pub(crate) fn block_state_table(self) -> BlockStateTable {
+        self.block_state_table
+    }
+
+    pub(crate) fn get_textures(self, state: BlockState) -> Option<&'a FaceTextures> {
+        self.assets
+            .textures
+            .get(self.block_state_table.block_state_data(state).id)
+    }
+
+    pub(crate) fn get_baked_model(self, state: BlockState) -> Option<&'a BakedModel> {
+        self.assets
+            .state_render(self.block_state_table, state)?
+            .model
+            .as_deref()
+    }
+
+    pub(crate) fn get_multipart_quads(
+        self,
+        state: BlockState,
+    ) -> Option<Vec<&'a model::BakedQuad>> {
+        let block_state_data = self.block_state_table.block_state_data(state);
+        let entries = self.assets.multipart.get(block_state_data.id)?;
+        let mut quads = Vec::new();
+        for entry in entries {
+            let when = entry.when.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+            if constraints_match(&block_state_data.properties, when) {
+                quads.extend(entry.quads.iter());
+            }
+        }
+        if quads.is_empty() { None } else { Some(quads) }
+    }
+
+    pub(crate) fn is_opaque_full_cube(self, state: BlockState) -> bool {
+        self.assets
+            .state_render(self.block_state_table, state)
+            .is_some_and(|r| r.opaque_full_cube)
+    }
+
+    /// Full cubes that can occlude, excluding glass and other no-occlusion
+    /// cubes.
+    pub(crate) fn occludes_neighbor(self, state: BlockState) -> bool {
+        self.assets
+            .state_render(self.block_state_table, state)
+            .is_some_and(|r| r.occludes)
+    }
+
+    /// Non-fluid occluders whose every quad has a cullface.
+    pub(crate) fn hidden_when_enclosed(self, state: BlockState) -> bool {
+        self.assets
+            .state_render(self.block_state_table, state)
+            .is_some_and(|r| r.hidden_when_enclosed)
     }
 }
 

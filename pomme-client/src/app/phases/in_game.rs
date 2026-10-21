@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,8 +44,9 @@ use crate::ui::chat::{ChatState, ChatUiAction};
 use crate::ui::death::{self, DeathAction};
 use crate::ui::pause::{self, PauseAction, PauseScreen};
 use crate::ui::{common, hud};
+use crate::world::block::BedDirection;
+use crate::world::block::block_registry::{BlockDefinitions, BlockRegistry};
 use crate::world::block::model::CardinalLightType;
-use crate::world::block::{BedDirection, bed_direction};
 use crate::world::block_entity_anim::BlockEntityAnimStore;
 use crate::world::chunk::ChunkStore;
 
@@ -173,6 +175,8 @@ pub struct GameState {
     pub bundle_scroll: (f32, f32),
     /// Server registries, for hashing predicted container clicks.
     pub registries: Arc<azalea_core::registry_holder::RegistryHolder>,
+    /// Session metadata and state bindings to the app-owned block definitions.
+    pub(crate) block_registry: BlockRegistry,
     /// Per-session recipe book, recipe container, ghost placement, and item
     /// tags.
     pub recipe_book: crate::recipe::RecipeBookState,
@@ -271,6 +275,7 @@ pub struct GameState {
     pub server_simulation_distance: u32,
     pub item_entity_store: ItemEntityStore,
     pub particle_store: crate::particle::ParticleStore,
+    pub level_runtime: crate::world::level::LevelRuntime,
     pub block_entity_anim: BlockEntityAnimStore,
     pub benchmark: Option<Benchmark>,
     pub benchmark_result: Option<BenchmarkResult>,
@@ -362,17 +367,22 @@ impl GameState {
         self.recent_sounds.push_back(sound.event_name().to_owned());
     }
 
-    pub fn new(
+    pub(crate) fn new(
         renderer: &Renderer,
         resource_packs: &ResourcePackManager,
         render_distance: u32,
         singleplayer: bool,
         chat_options: crate::ui::chat::ChatOptions,
+        block_definitions: Rc<BlockDefinitions>,
+        protocol: i32,
     ) -> Self {
+        let block_registry =
+            BlockRegistry::new(block_definitions, renderer.shared_render_assets(), protocol);
         let biome_climate = Arc::new(HashMap::new());
         // The dimension's shade table arrives with `DimensionInfo`, which
         // builds a fresh dispatcher.
         let mesh_dispatcher = renderer.create_mesh_dispatcher(
+            block_registry.owned_render_view(),
             biome_climate,
             Some(resource_packs),
             Default::default(),
@@ -410,6 +420,7 @@ impl GameState {
                 )
             },
             block_entity_anim: BlockEntityAnimStore::default(),
+            level_runtime: crate::world::level::LevelRuntime::new(),
             player: LocalPlayer::new(),
             last_bubble_pop_sound_played: 0,
             biome_climate: Arc::new(HashMap::new()),
@@ -441,6 +452,7 @@ impl GameState {
             bundle_hovered: None,
             bundle_scroll: (0.0, 0.0),
             registries: Arc::new(azalea_core::registry_holder::RegistryHolder::default()),
+            block_registry,
             recipe_book: crate::recipe::RecipeBookState::default(),
             recipe_book_ui: crate::ui::recipe_book::RecipeBookUiState::new(),
             chat: {
@@ -868,12 +880,14 @@ impl GameState {
                         t.block_pos.y,
                         t.block_pos.z,
                     );
-                    let props = crate::world::block::block_properties(state)
+                    let block_state_data = self.block_registry.block_state_data(state);
+                    let props = block_state_data
+                        .properties()
                         .entries()
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect::<Vec<_>>()
                         .join(",");
-                    let block = crate::world::block::block_id(state);
+                    let block = block_state_data.id();
                     let desc = if props.is_empty() {
                         block.to_string()
                     } else {
@@ -1058,8 +1072,11 @@ impl GameState {
     /// them tier-gated), individual lit sections remesh on the priority lane.
     pub fn update_light(&mut self, chunk_detail: u32) {
         let mut dirty = crate::world::light::LightDirty::default();
-        self.light_engine
-            .poll_and_run(&mut self.chunk_store, &mut dirty);
+        self.light_engine.poll_and_run(
+            &mut self.chunk_store,
+            self.block_registry.block_state_table(),
+            &mut dirty,
+        );
         if dirty.columns.is_empty() && dirty.sections.is_empty() {
             return;
         }
@@ -2103,11 +2120,13 @@ fn detached_distance(own: f32, mount: Option<f32>) -> f32 {
 
 /// Vanilla `LivingEntity.getBedOrientation` for a sleeper's bed.
 fn bed_orientation(
-    chunks: &ChunkStore,
+    game: &GameState,
     sleeping_pos: Option<crate::position::BlockPos>,
 ) -> Option<BedDirection> {
     let pos = sleeping_pos?;
-    bed_direction(chunks.get_block_state(pos.x, pos.y, pos.z))
+    game.block_registry
+        .block_state_data(game.chunk_store.get_block_state(pos.x, pos.y, pos.z))
+        .bed_direction()
 }
 
 /// Vanilla `LivingEntityRenderer`: hurt or dying entities take the red overlay.
@@ -2265,8 +2284,15 @@ pub fn update_game(
             game.player.effects.tick();
             game.player.tick_sleep();
         }
-        game.item_entity_store.tick(&game.chunk_store);
-        game.particle_store.tick(&game.chunk_store);
+        game.item_entity_store
+            .tick(&game.chunk_store, game.block_registry.block_state_table());
+        game.level_runtime.animate_tick(
+            &game.block_registry,
+            &game.chunk_store,
+            *game.player.position,
+        );
+        game.particle_store
+            .tick(&game.chunk_store, game.block_registry.block_state_table());
         game.block_entity_anim.tick();
         crate::app::core::tick_moving_pistons(core, game);
         game.title.tick();
@@ -2274,7 +2300,9 @@ pub fn update_game(
         // LocalPlayer.handlePortalTransitionEffect belongs to aiStep, which is
         // skipped once tickDeath removes the player at exactly death tick 20.
         let local_player_ai_step_ran = !game.dead || !game.player.death_animation_finished();
-        let inside_portal = game.player.is_inside_nether_portal(&game.chunk_store);
+        let inside_portal = game
+            .player
+            .is_inside_nether_portal(&game.chunk_store, game.block_registry.block_state_table());
         if local_player_ai_step_ran && game.player.tick_portal_effect(inside_portal) {
             // Vanilla forLocalAmbience: AMBIENT category at the listener,
             // volume 0.25, pitch 0.8..1.2.
@@ -2449,7 +2477,7 @@ pub fn update_game(
     let mut pause_action = PauseAction::None;
     let mut death_action = DeathAction::None;
 
-    let sleeping_direction = bed_orientation(&game.chunk_store, game.player.sleeping_pos);
+    let sleeping_direction = bed_orientation(game, game.player.sleeping_pos);
     let is_sleeping = game.player.is_sleeping();
     // `Camera.alignWithEntity`, then the first-person sleeping `move(0, 0.15, 0)`.
     let first_person_lift = if is_sleeping && gfx.renderer.is_first_person() {
@@ -2490,6 +2518,7 @@ pub fn update_game(
     gfx.renderer
         .set_view_bob(bob_walk, bob_amount, core.menu.view_bobbing);
     gfx.renderer.update_third_person_distance(
+        game.block_registry.render_view(),
         camera_pivot,
         &game.chunk_store,
         game.third_person_distance(),
@@ -2529,14 +2558,16 @@ pub fn update_game(
                 let state =
                     game.chunk_store
                         .get_block_state(t.block_pos.x, t.block_pos.y, t.block_pos.z);
-                let props = crate::world::block::block_properties(state)
+                let block_state_data = game.block_registry.block_state_data(state);
+                let props = block_state_data
+                    .properties()
                     .entries()
                     .map(|(k, v)| format!("{k}: {v}"))
                     .collect();
                 Some((
                     t.block_pos,
                     t.face,
-                    crate::world::block::block_id(state).to_string(),
+                    block_state_data.id().to_string(),
                     props,
                 ))
             }),
@@ -3785,7 +3816,7 @@ pub fn update_game(
                         partial_tick,
                     ),
                     is_sleeping,
-                    sleeping_direction: bed_orientation(&game.chunk_store, e.sleeping_pos),
+                    sleeping_direction: bed_orientation(game, e.sleeping_pos),
                     sleeping_eye_height: standing_eye_height(e.entity_type, e.is_baby),
                     is_baby: e.is_baby,
                     is_crouching: e.is_crouching,
@@ -3947,13 +3978,14 @@ pub fn update_game(
             .iter()
             .filter_map(|(pos, be)| {
                 let state = game.chunk_store.get_block_state(pos.x, pos.y, pos.z);
-                let id = crate::world::block::block_id(state);
+                let block_state_data = game.block_registry.block_state_data(state);
+                let id = block_state_data.id();
                 // A predicted break leaves a stale entry until the server
                 // confirms; don't render entries whose block is gone.
                 if !crate::world::block_entity::is_block_entity_block(id) {
                     return None;
                 }
-                let props = crate::world::block::block_properties(state);
+                let props = block_state_data.properties();
                 let variant = block_entity::variant_for_block(be.kind, id, props);
                 let yaw = block_entity::yaw_for_block(be.kind, props);
                 let openness_at = |p: &BlockPos| {
@@ -4043,6 +4075,7 @@ pub fn update_game(
     // the cursor mid-frame), so the renderer doesn't re-hide it from a stale value.
     let hide_cursor = game.input_live() && !game.dead && core.input.is_cursor_captured();
     if let Err(e) = gfx.renderer.render_world(
+        game.block_registry.render_view(),
         &gfx.window,
         hide_cursor,
         elements,
@@ -4057,6 +4090,7 @@ pub fn update_game(
         ShadowScene {
             casters: &shadow_casters,
             chunks: &game.chunk_store,
+            block_state_table: game.block_registry.block_state_table(),
             sky_darken: game.sky_darken(),
             ambient_light: game.ambient_light,
         },
@@ -4380,14 +4414,14 @@ fn dropped_item_geometry(renderer: &Renderer, item_name: &str) -> (glam::Mat4, f
     let mesh = renderer.item_mesh_info(item_name);
     let is_block_model = mesh
         .map(|mesh| mesh.is_block_model)
-        .unwrap_or_else(|| renderer.registry().get_item_model(item_name).is_some());
+        .unwrap_or_else(|| renderer.render_assets().get_item_model(item_name).is_some());
     let fallback_transform = if is_block_model {
         crate::world::block::model::default_block_ground_transform()
     } else {
         glam::Mat4::from_scale(glam::Vec3::splat(0.5))
     };
     let ground_transform = renderer
-        .registry()
+        .render_assets()
         .get_item_ground_transform(item_name)
         .unwrap_or(fallback_transform);
     let (bounds_min, bounds_max) = mesh
@@ -4413,7 +4447,7 @@ fn dropped_item_geometry(renderer: &Renderer, item_name: &str) -> (glam::Mat4, f
 #[allow(clippy::too_many_arguments)]
 fn emit_item_copies(
     infos: &mut Vec<crate::renderer::pipelines::item_entity::ItemRenderInfo>,
-    registry: &crate::world::block::registry::BlockRegistry,
+    render_assets: &crate::world::block::render_assets::BlockRenderAssets,
     item_name: &str,
     item_id: u32,
     damage: i32,
@@ -4441,7 +4475,7 @@ fn emit_item_copies(
         * glam::Mat4::from_rotation_y(spin);
     // Dropped item entities are not LivingEntity owners in vanilla, so a
     // `team` tint source falls back to the JSON default here.
-    let tints: std::sync::Arc<[u32]> = registry
+    let tints: std::sync::Arc<[u32]> = render_assets
         .item_tint_palette(item_name, item_stack, None)
         .into();
     let mut push = |copy_offset: glam::Mat4| {
@@ -4486,15 +4520,16 @@ fn moving_block_renders(
     camera_pos: glam::DVec3,
     partial_tick: f32,
 ) -> Vec<crate::renderer::chunk::moving_blocks::MovingBlockRender> {
-    use crate::world::block::{block_id, is_air, with_property};
     use crate::world::piston;
     /// Vanilla `PistonHeadRenderer.getViewDistance`.
     const VIEW_DISTANCE: f64 = 68.0;
+    let blocks = game.block_registry.block_state_table();
     let mut renders = Vec::new();
     for (pos, moving) in game.block_entity_anim.pistons.iter() {
         let state = moving.moved_state;
+        let data = blocks.block_state_data(state);
         let center = glam::DVec3::new(pos.x as f64, pos.y as f64, pos.z as f64) + 0.5;
-        if is_air(state) || center.distance_squared(camera_pos) >= VIEW_DISTANCE * VIEW_DISTANCE {
+        if data.is_air() || center.distance_squared(camera_pos) >= VIEW_DISTANCE * VIEW_DISTANCE {
             continue;
         }
         let origin = [pos.x, pos.y, pos.z];
@@ -4510,14 +4545,20 @@ fn moving_block_renders(
         };
         let progress = moving.progress(partial_tick);
         let offset = moving.offset(partial_tick);
-        if block_id(state) == "piston_head" && progress <= 4.0 {
-            mesh(piston::with_short(state, progress <= 0.5), cell, offset);
+        if data.id() == "piston_head" && progress <= 4.0 {
+            mesh(
+                piston::with_short(blocks, state, progress <= 0.5),
+                cell,
+                offset,
+            );
         } else if moving.source && !moving.extending {
-            let Some(head) = piston::head_of(state, progress >= 0.5) else {
+            let Some(head) = piston::head_of(blocks, state, progress >= 0.5) else {
                 continue;
             };
             mesh(head, cell, offset);
-            let base = with_property(state, "extended", "true").unwrap_or(state);
+            let base = blocks
+                .with_property(state, "extended", "true")
+                .unwrap_or(state);
             mesh(base, origin, [0.0; 3]);
         } else {
             mesh(state, cell, offset);
@@ -4568,7 +4609,7 @@ fn build_item_render_infos(
         let (ground_transform, min_y, z_size) = dropped_item_geometry(renderer, &item.item_name);
         emit_item_copies(
             &mut infos,
-            renderer.registry(),
+            renderer.render_assets(),
             &item.item_name,
             item.item_id,
             item.damage,
@@ -4593,7 +4634,7 @@ fn build_item_render_infos(
         let (ground_transform, min_y, z_size) = dropped_item_geometry(renderer, &pickup.item_name);
         emit_item_copies(
             &mut infos,
-            renderer.registry(),
+            renderer.render_assets(),
             &pickup.item_name,
             pickup.item_id,
             pickup.damage,

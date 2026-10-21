@@ -9,9 +9,12 @@ use azalea_block::BlockState;
 use parking_lot::RwLock;
 
 use super::storage::LightPos;
+use crate::world::block::BlockStateTable;
 use crate::world::chunk::{Chunk, ChunkStore};
 
 pub(crate) trait LightBlockGetter {
+    fn block_state_table(&self) -> BlockStateTable;
+
     fn state(&self, pos: LightPos) -> BlockState;
 
     /// Vanilla clears the engine's chunk cache between the decrease and
@@ -23,6 +26,7 @@ type CacheEntry = ((i32, i32), Option<Arc<RwLock<Chunk>>>);
 
 /// [`ChunkStore`]-backed getter, constructed fresh per light-update run.
 pub(crate) struct StoreWorld<'a> {
+    block_state_table: BlockStateTable,
     store: &'a ChunkStore,
     bedrock: BlockState,
     min_y: i32,
@@ -32,10 +36,13 @@ pub(crate) struct StoreWorld<'a> {
 const INVALID_CHUNK: (i32, i32) = (i32::MAX, i32::MAX);
 
 impl<'a> StoreWorld<'a> {
-    pub fn new(store: &'a ChunkStore) -> Self {
+    pub fn new(store: &'a ChunkStore, block_state_table: BlockStateTable) -> Self {
         Self {
+            block_state_table,
             store,
-            bedrock: crate::world::block::first_state_of("bedrock").unwrap_or(BlockState::AIR),
+            bedrock: block_state_table
+                .first_state_of("bedrock")
+                .unwrap_or(BlockState::AIR),
             min_y: store.min_y(),
             cache: RefCell::new([(INVALID_CHUNK, None), (INVALID_CHUNK, None)]),
         }
@@ -58,6 +65,10 @@ impl<'a> StoreWorld<'a> {
 }
 
 impl LightBlockGetter for StoreWorld<'_> {
+    fn block_state_table(&self) -> BlockStateTable {
+        self.block_state_table
+    }
+
     fn state(&self, pos: LightPos) -> BlockState {
         let Some(chunk) = self.chunk(pos.x >> 4, pos.z >> 4) else {
             return self.bedrock;
