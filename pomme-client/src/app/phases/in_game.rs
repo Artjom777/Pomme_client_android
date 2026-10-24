@@ -1860,17 +1860,52 @@ fn apply_result_action(
     }
 }
 
-/// Set the active render distance (the persisted menu value) and push it to the
-/// server — used by the chunk-load benchmark as it ramps the distance up and
-/// down.
+/// Starts the chunk-load benchmark at `rd`, from the pause menu or
+/// `--chunk-bench`.
+pub fn start_chunk_load(
+    core: &mut AppCore,
+    gfx: &Gfx,
+    connection: &ConnectionHandle,
+    game: &mut GameState,
+    rd: u32,
+) {
+    game.chunk_load_bench = Some(ChunkLoadBench::new(
+        rd,
+        game.server_render_distance,
+        gfx.renderer.gpu_name(),
+        gfx.renderer.vulkan_version(),
+        gfx.renderer.screen_width(),
+        gfx.renderer.screen_height(),
+        [
+            game.player.position.x,
+            game.player.position.y,
+            game.player.position.z,
+        ],
+    ));
+    game.chunk_load_result = None;
+    // Drop to the minimum render distance so the server unloads the far
+    // chunks; the driver raises it to the target once the reset settles.
+    apply_render_distance(core, game, connection, crate::benchmark::CHUNK_LOAD_MIN_RD);
+}
+
+/// Set the chunk-load benchmark's render distance and push it to the server
+/// as it ramps the distance up and down.
 fn apply_render_distance(
     core: &mut AppCore,
     game: &mut GameState,
     connection: &ConnectionHandle,
     rd: u32,
 ) {
-    core.menu.render_distance = rd;
+    core.menu.set_bench_render_distance(rd);
     game.sync_client_information(connection, rd, core.menu.chat_options);
+}
+
+/// Puts back the render distance the chunk-load benchmark replaced, on the
+/// server too.
+fn end_chunk_load(core: &mut AppCore, game: &mut GameState, connection: &ConnectionHandle) {
+    if let Some(rd) = core.menu.restore_bench_render_distance() {
+        game.sync_client_information(connection, rd, core.menu.chat_options);
+    }
 }
 
 /// Vanilla `ScrollWheelHandler.onMouseScroll` on one frame's (x, y) scroll,
@@ -2542,11 +2577,9 @@ pub fn update_game(
         &game.chunk_store,
         game.third_person_distance(),
     );
-    // Esc cancels a running benchmark: restore the render distance it changed.
-    if std::mem::take(&mut game.chunk_load_abort)
-        && let Some(bench) = game.chunk_load_bench.take()
-    {
-        apply_render_distance(core, game, connection, bench.original_rd());
+    // Esc cancels a running benchmark.
+    if std::mem::take(&mut game.chunk_load_abort) && game.chunk_load_bench.take().is_some() {
+        end_chunk_load(core, game, connection);
     }
     // Watch the chunk-load benchmark from straight above, framed to its load
     // radius.
@@ -3010,7 +3043,7 @@ pub fn update_game(
                 game.chunk_load_bench = Some(bench);
             }
             ChunkLoadStep::Done(result) => {
-                apply_render_distance(core, game, connection, bench.original_rd());
+                end_chunk_load(core, game, connection);
                 tracing::info!(
                     "Chunk load RD {} (effective {}): {} chunks in {:.2}s ({:.0} chunks/s), \
                      first chunk {:.2}s, frame avg {:.1}ms / worst {:.1}ms",
@@ -4232,26 +4265,9 @@ pub fn update_game(
             core.apply_cursor_grab(&gfx.window, Some(game));
         }
         PauseAction::StartChunkLoad(rd) => {
-            game.chunk_load_bench = Some(ChunkLoadBench::new(
-                rd,
-                core.menu.render_distance,
-                game.server_render_distance,
-                gfx.renderer.gpu_name(),
-                gfx.renderer.vulkan_version(),
-                gfx.renderer.screen_width(),
-                gfx.renderer.screen_height(),
-                [
-                    game.player.position.x,
-                    game.player.position.y,
-                    game.player.position.z,
-                ],
-            ));
-            game.chunk_load_result = None;
+            start_chunk_load(core, gfx, connection, game, rd);
             game.pause_screen = PauseScreen::Main;
             game.paused = false;
-            // Drop to the minimum render distance so the server unloads the far
-            // chunks; the driver raises it to the target once the reset settles.
-            apply_render_distance(core, game, connection, crate::benchmark::CHUNK_LOAD_MIN_RD);
             core.apply_cursor_grab(&gfx.window, Some(game));
         }
         PauseAction::ReportBugs => {
