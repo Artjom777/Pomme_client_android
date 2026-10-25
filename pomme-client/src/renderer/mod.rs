@@ -181,8 +181,9 @@ enum RenderMode<'a> {
     World {
         block_render: BlockRenderView<'a>,
         overlay: Vec<MenuElement>,
-        swing_progress: f32,
-        use_anim: Option<pipelines::held_item::UseAnim>,
+        /// The main hand's then the offhand's, as for `held_items`.
+        swing_progress: [f32; 2],
+        use_anim: [Option<pipelines::held_item::UseAnim>; 2],
         /// The main hand's then the offhand's item.
         held_items: [Option<pipelines::held_item::HeldItemInfo>; 2],
         main_hand_right: bool,
@@ -981,8 +982,8 @@ impl Renderer {
         window: &Window,
         hide_cursor: bool,
         overlay: Vec<MenuElement>,
-        swing_progress: f32,
-        use_anim: Option<pipelines::held_item::UseAnim>,
+        swing_progress: [f32; 2],
+        use_anim: [Option<pipelines::held_item::UseAnim>; 2],
         held_items: [Option<(String, f32, azalea_inventory::ItemStackData)>; 2],
         main_hand_right: bool,
         shown_hands: HandRenderSelection,
@@ -1691,42 +1692,30 @@ impl Renderer {
                     // TODO: map (`renderOneHandedMap`/`renderTwoHandedMap`)
                     // and the crossbow loading pose, once crossbow use is
                     // tracked.
-                    let [main_hand, off_hand] = held_items;
-                    if shown_hands.main && main_hand.is_none() {
+                    if shown_hands.main && held_items[0].is_none() {
                         self.hand_pipeline.update_and_draw(
                             &mut pass,
                             frame,
                             aspect,
                             hud_fov,
-                            *swing_progress,
+                            swing_progress[0],
                             *main_hand_right,
                             view_effect,
                         );
                     }
-                    // TODO: the offhand's own swing and use animations
-                    // (`swingingArm`, `getUsedItemHand`) once it can be used.
-                    let main =
-                        main_hand
-                            .as_ref()
-                            .filter(|_| shown_hands.main)
-                            .map(|item| HeldHand {
-                                item,
-                                main_hand: true,
-                                right_arm: *main_hand_right,
-                                swing_progress: *swing_progress,
-                                use_anim: *use_anim,
-                            });
-                    let off = off_hand
-                        .as_ref()
-                        .filter(|_| shown_hands.off)
-                        .map(|item| HeldHand {
-                            item,
-                            main_hand: false,
-                            right_arm: !*main_hand_right,
-                            swing_progress: 0.0,
-                            use_anim: None,
-                        });
-                    let hands: Vec<_> = main.into_iter().chain(off).collect();
+                    let shown = [shown_hands.main, shown_hands.off];
+                    let hands: Vec<_> = (0..2)
+                        .filter(|&i| shown[i])
+                        .filter_map(|i| {
+                            Some(HeldHand {
+                                item: held_items[i].as_ref()?,
+                                main_hand: i == 0,
+                                right_arm: *main_hand_right == (i == 0),
+                                swing_progress: swing_progress[i],
+                                use_anim: use_anim[i],
+                            })
+                        })
+                        .collect();
                     if !hands.is_empty() {
                         self.held_item_pipeline.update_and_draw(
                             &self.ctx.device,
