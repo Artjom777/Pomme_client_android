@@ -2432,6 +2432,23 @@ pub enum SpriteId {
     MinecraftLogo,
     MinecraftEdition,
     BedrockTitle,
+    BedrockButton,
+    BedrockButtonHover,
+    BedrockButtonPressed,
+    BedrockOutline,
+    BedrockRealms,
+    BedrockRealmsHover,
+    BedrockRealmsPressed,
+    BedrockSocial,
+    BedrockSocialHover,
+    BedrockBlack,
+    BedrockDropdown,
+    BedrockDropdownHover,
+    BedrockDropdownSelect,
+    BedrockRadioOn,
+    BedrockRadioOnHover,
+    BedrockRadioOff,
+    BedrockRadioOffHover,
     IconFriends,
     IconLanguage,
     IconAccessibility,
@@ -2573,6 +2590,53 @@ fn downscale_straight_alpha(src: &image::RgbaImage, w: u32, h: u32) -> image::Rg
         ]);
     }
     out
+}
+
+/// The Bedrock UI textures the Bedrock title screen draws, by path from
+/// `textures/ui` without the extension.
+const BEDROCK_SPRITES: [(SpriteId, &str); 17] = [
+    (SpriteId::BedrockButton, "button_borderless_light"),
+    (SpriteId::BedrockButtonHover, "button_borderless_lighthover"),
+    (
+        SpriteId::BedrockButtonPressed,
+        "button_borderless_lightpressed",
+    ),
+    (SpriteId::BedrockOutline, "focus_border_white"),
+    (SpriteId::BedrockRealms, "realms_button_borderless_default"),
+    (
+        SpriteId::BedrockRealmsHover,
+        "realms_button_borderless_hover",
+    ),
+    (
+        SpriteId::BedrockRealmsPressed,
+        "realms_button_borderless_hover_pressed",
+    ),
+    (
+        SpriteId::BedrockSocial,
+        "socialbuttonicon/social-default-icon",
+    ),
+    (
+        SpriteId::BedrockSocialHover,
+        "socialbuttonicon/social-hover-icon",
+    ),
+    (SpriteId::BedrockBlack, "Black"),
+    (SpriteId::BedrockDropdown, "dropdown_background"),
+    (SpriteId::BedrockDropdownHover, "dropDownHoverBG"),
+    (SpriteId::BedrockDropdownSelect, "dropDownSelectBG"),
+    (SpriteId::BedrockRadioOn, "radio_on"),
+    (SpriteId::BedrockRadioOnHover, "radio_on_hover"),
+    (SpriteId::BedrockRadioOff, "radio_off"),
+    (SpriteId::BedrockRadioOffHover, "radio_off_hover"),
+];
+
+/// The `nineslice_size` from the `.json` Bedrock keeps beside a texture, in
+/// texels. Only the single-number form is read; anything else is unsliced.
+fn bedrock_nine_slice(dir: &Path, stem: &str) -> f32 {
+    std::fs::read(dir.join(format!("{stem}.json")))
+        .ok()
+        .and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok())
+        .and_then(|meta| meta.get("nineslice_size")?.as_f64())
+        .map_or(0.0, |size| size as f32)
 }
 
 fn build_sprite_atlas(
@@ -3902,6 +3966,16 @@ fn build_sprite_atlas(
             }
             Err(e) => tracing::debug!("No Bedrock title yet: {e}"),
         }
+        for (id, stem) in BEDROCK_SPRITES {
+            match crate::assets::load_image(&dir.join(format!("{stem}.png"))) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = (rgba.width(), rgba.height());
+                    images.push((id, rgba.into_raw(), w, h, bedrock_nine_slice(dir, stem)));
+                }
+                Err(e) => tracing::debug!("No Bedrock sprite {stem} yet: {e}"),
+            }
+        }
     }
 
     let sizes: Vec<(u32, u32)> = images.iter().map(|sprite| (sprite.2, sprite.3)).collect();
@@ -5147,6 +5221,22 @@ mod tests {
         let mut rng = ObfuscationRng::new(0);
         let got: Vec<usize> = (0..10).map(|_| rng.next_int(16)).collect();
         assert_eq!(got, [11, 13, 3, 9, 10, 4, 8, 1, 9, 12]);
+    }
+
+    #[test]
+    fn bedrock_nine_slice_reads_the_number_form_only() {
+        let dir = std::env::temp_dir().join(format!("pomme-nine-slice-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (stem, json) in [
+            ("number", r#"{ "nineslice_size": 2, "base_size": [4, 4] }"#),
+            ("array", r#"{ "nineslice_size": [1, 2, 1, 2] }"#),
+        ] {
+            std::fs::write(dir.join(format!("{stem}.json")), json).unwrap();
+        }
+        assert_eq!(bedrock_nine_slice(&dir, "number"), 2.0);
+        assert_eq!(bedrock_nine_slice(&dir, "array"), 0.0);
+        assert_eq!(bedrock_nine_slice(&dir, "missing"), 0.0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

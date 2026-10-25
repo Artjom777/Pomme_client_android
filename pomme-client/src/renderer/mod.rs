@@ -211,8 +211,16 @@ enum RenderMode<'a> {
         blur: f32,
         elements: Vec<MenuElement>,
         cursor: (f32, f32),
-        show_skin: bool,
+        skin: Option<MenuSkin>,
     },
+}
+
+/// Where a menu screen draws the player's rotating skin: its anchor as screen
+/// fractions and a size factor.
+#[derive(Clone, Copy)]
+pub struct MenuSkin {
+    pub at: (f32, f32),
+    pub scale: f32,
 }
 
 #[derive(Default, Clone)]
@@ -1074,7 +1082,7 @@ impl Renderer {
         blur: f32,
         elements: Vec<MenuElement>,
         cursor: (f32, f32),
-        show_skin: bool,
+        skin: Option<MenuSkin>,
     ) -> Result<(), RendererError> {
         self.render_frame(
             window,
@@ -1085,7 +1093,7 @@ impl Renderer {
                 blur,
                 elements,
                 cursor,
-                show_skin,
+                skin,
             },
         )
     }
@@ -1182,9 +1190,9 @@ impl Renderer {
             .reload_cubemap(&self.ctx.device, faces);
     }
 
-    /// Brings the Bedrock title into the menu atlas when its files arrived
-    /// after the atlas was built.
-    pub fn load_bedrock_title(&mut self, bedrock_ui_dir: &Path) {
+    /// Brings the Bedrock title and button sprites into the menu atlas when
+    /// their files arrived after the atlas was built.
+    pub fn load_bedrock_sprites(&mut self, bedrock_ui_dir: &Path) {
         if self.menu_pipeline.has_sprite(SpriteId::BedrockTitle) {
             return;
         }
@@ -1242,8 +1250,9 @@ impl Renderer {
             .update_favicon_atlas(&self.ctx.device, favicons);
     }
 
-    /// Friend faces reuse the favicon atlas — they're never shown on the same
-    /// screen as server favicons, so they share one string-keyed RGBA atlas.
+    /// Player faces reuse the string-keyed favicon atlas, which holds only
+    /// the last upload; the menu sends faces and favicons together
+    /// (`MainMenu::menu_atlas_images`).
     pub fn update_face_atlas(&mut self, faces: &[(String, Vec<u8>, u32)]) {
         self.update_favicon_atlas(faces);
     }
@@ -1790,7 +1799,7 @@ impl Renderer {
                 blur,
                 elements,
                 cursor,
-                show_skin,
+                skin,
             } => {
                 let aspect = sw / sh.max(1.0);
                 self.panorama_pipeline
@@ -1836,9 +1845,10 @@ impl Renderer {
                     );
                 }
 
-                if *show_skin {
+                if let Some(skin) = *skin {
                     self.skin_preview.draw(
-                        &mut pass, frame, aspect, 0.7, 0.5, cursor.0, cursor.1, sw, sh,
+                        &mut pass, frame, aspect, skin.at.0, skin.at.1, skin.scale, cursor.0,
+                        cursor.1, sw, sh,
                     );
                 }
 

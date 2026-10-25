@@ -1,4 +1,5 @@
 mod account;
+mod bedrock_screen;
 mod credits;
 mod friends_screen;
 pub(crate) mod helpers;
@@ -622,6 +623,11 @@ pub struct MainMenu {
     bedrock: Arc<parking_lot::Mutex<BedrockDownload>>,
     /// Bedrock was the last theme picked, so its download switches to it.
     bedrock_pending: bool,
+    /// Where the Bedrock title screen last placed its skin model.
+    bedrock_skin: Option<crate::renderer::MenuSkin>,
+    /// The signed-in player's undashed UUID, whose face the Bedrock Profile
+    /// button shows.
+    player_face: Option<String>,
     scroll_offset: f32,
     /// Which text field of the current form has keyboard focus (index within
     /// the form). Separate from `focus` (button/widget focus ring).
@@ -787,6 +793,8 @@ impl MainMenu {
             bedrock_dir,
             bedrock: Arc::new(parking_lot::Mutex::new(BedrockDownload::Idle)),
             bedrock_pending: false,
+            bedrock_skin: None,
+            player_face: None,
             scroll_offset: 0.0,
             focused_field: None,
             last_field_click_time: Instant::now(),
@@ -923,6 +931,15 @@ impl MainMenu {
     /// `Mth::square`).
     pub fn fov_effect(&self) -> f32 {
         self.fov_effect_scale * self.fov_effect_scale
+    }
+
+    /// The player whose skin the title screen shows, `None` without a
+    /// profile. Starts fetching their face for the Bedrock Profile button.
+    pub(crate) fn set_player_face(&mut self, uuid: Option<&uuid::Uuid>) {
+        self.player_face = uuid.map(|uuid| uuid.simple().to_string());
+        if let Some(uuid) = &self.player_face {
+            friends::fetch_face(&self.rt, uuid.clone(), &self.face_cache);
+        }
     }
 
     /// The account the menu shows and joins with.
@@ -1137,10 +1154,20 @@ impl MainMenu {
         self.theme
     }
 
-    /// The rotating 3D skin is Pomme's own chrome; the vanilla title screen
-    /// has no such thing.
-    pub fn show_skin_preview(&self) -> bool {
-        self.is_main_screen() && self.theme == PanoramaTheme::Pomme
+    /// The title screen's rotating 3D skin. Pomme's and Bedrock's screens
+    /// have one; the vanilla title screen has no such thing.
+    pub fn skin_preview(&self) -> Option<crate::renderer::MenuSkin> {
+        if !self.is_main_screen() {
+            return None;
+        }
+        match self.theme {
+            PanoramaTheme::Pomme => Some(crate::renderer::MenuSkin {
+                at: (0.7, 0.5),
+                scale: 1.0,
+            }),
+            PanoramaTheme::Bedrock => self.bedrock_skin,
+            PanoramaTheme::Java => None,
+        }
     }
 
     /// Picks the title screen's splash line. Separate from `new` because the
@@ -1161,15 +1188,36 @@ impl MainMenu {
         );
     }
 
-    pub fn is_server_list_screen(&self) -> bool {
+    fn is_server_list_screen(&self) -> bool {
         matches!(self.screen, Screen::ServerList)
     }
 
-    pub fn is_friends_screen(&self) -> bool {
+    fn is_friends_screen(&self) -> bool {
         matches!(self.screen, Screen::Friends)
     }
 
-    pub fn favicons_changed(&mut self) -> bool {
+    /// The favicons and faces the current screen draws, once either changed
+    /// (`set_screen` marks both changed).
+    pub fn menu_atlas_images(&mut self) -> Option<Vec<(String, Vec<u8>, u32)>> {
+        let bedrock_main = self.is_main_screen() && self.theme == PanoramaTheme::Bedrock;
+        let favicons = bedrock_main || self.is_server_list_screen();
+        let faces = bedrock_main || self.is_friends_screen();
+        let favicons_changed = favicons && self.favicons_changed();
+        let faces_changed = faces && self.faces_changed();
+        if !favicons_changed && !faces_changed {
+            return None;
+        }
+        let mut images = Vec::new();
+        if favicons {
+            images.extend(self.collect_favicons());
+        }
+        if faces {
+            images.extend(self.collect_faces());
+        }
+        (!images.is_empty()).then_some(images)
+    }
+
+    fn favicons_changed(&mut self) -> bool {
         let count = self
             .ping_results
             .read()
@@ -1191,7 +1239,7 @@ impl MainMenu {
         )
     }
 
-    pub fn collect_favicons(&self) -> Vec<(String, Vec<u8>, u32)> {
+    fn collect_favicons(&self) -> Vec<(String, Vec<u8>, u32)> {
         let results = self.ping_results.read();
         results
             .iter()
@@ -1210,12 +1258,12 @@ impl MainMenu {
             .collect()
     }
 
-    pub fn faces_changed(&mut self) -> bool {
+    fn faces_changed(&mut self) -> bool {
         let count = self.face_cache.read().len();
         atlas_dirty(count, &mut self.last_face_count, &mut self.face_dirty_since)
     }
 
-    pub fn collect_faces(&self) -> Vec<(String, Vec<u8>, u32)> {
+    fn collect_faces(&self) -> Vec<(String, Vec<u8>, u32)> {
         self.face_cache
             .read()
             .iter()
@@ -1448,6 +1496,50 @@ fn test_menu(dir: &str, key_bindings: &mut KeyBindings) -> MainMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bedrock_title_screen_uploads_faces_and_favicons_together() {
+        let mut key_bindings = KeyBindings::default();
+        let mut menu = test_menu("pomme-menu-atlas-test", &mut key_bindings);
+        menu.theme = PanoramaTheme::Bedrock;
+        menu.face_cache
+            .write()
+            .insert("face".into(), vec![0; 8 * 8 * 4]);
+        menu.ping_results.write().insert(
+            "server".into(),
+            PingState::Success {
+                motd: Vec::new(),
+                online: 0,
+                max: 0,
+                latency_ms: 0,
+                version: String::new(),
+                protocol: 0,
+                compat: Compat::Native,
+                favicon_rgba: Some(vec![0; 64 * 64 * 4]),
+                player_names: Vec::new(),
+            },
+        );
+        // A change uploads once it has held for the debounce.
+        let settled = |menu: &mut MainMenu| {
+            assert!(menu.menu_atlas_images().is_none());
+            let pending = [&mut menu.favicon_dirty_since, &mut menu.face_dirty_since];
+            for at in pending.into_iter().flatten() {
+                *at -= std::time::Duration::from_secs(1);
+            }
+            menu.menu_atlas_images().map(|images| {
+                let mut keys: Vec<_> = images.into_iter().map(|(key, ..)| key).collect();
+                keys.sort();
+                keys
+            })
+        };
+        let both = Some(vec!["face".to_owned(), "server".to_owned()]);
+        assert_eq!(settled(&mut menu), both);
+        assert!(menu.menu_atlas_images().is_none());
+        menu.set_screen(Screen::Friends, &key_bindings);
+        assert_eq!(settled(&mut menu), Some(vec!["face".to_owned()]));
+        menu.set_screen(Screen::Main, &key_bindings);
+        assert_eq!(settled(&mut menu), both);
+    }
 
     #[test]
     fn a_chunk_bench_saves_the_players_render_distance_and_reads_their_chunk_detail() {
