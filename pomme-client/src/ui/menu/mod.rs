@@ -21,9 +21,9 @@ use crate::app::input::{Action, KeyBindings};
 use crate::audio::SoundCategory;
 use crate::renderer::CloudMode;
 use crate::renderer::pipelines::menu_overlay::{
-    ICON_CHECK, ICON_CODE, ICON_COMMENT, ICON_GEAR, ICON_GLOBE, ICON_LANGUAGE, ICON_LINK,
-    ICON_PAINTBRUSH, ICON_UNIVERSAL_ACCESS, ICON_USER, ICON_USERS, MenuElement, SpriteId,
-    TooltipLine,
+    ICON_CHECK, ICON_CODE, ICON_COMMENT, ICON_DOWNLOAD, ICON_GEAR, ICON_GLOBE, ICON_LANGUAGE,
+    ICON_LINK, ICON_PAINTBRUSH, ICON_RETRY, ICON_UNIVERSAL_ACCESS, ICON_USER, ICON_USERS,
+    MenuElement, SpriteId, TooltipLine,
 };
 use crate::ui::chat::ChatOptions;
 use crate::ui::font::FontOptions;
@@ -230,7 +230,7 @@ impl Default for Settings {
             cloud_mode: 2,
             attack_indicator: 1,
             display_mode: 0,
-            theme: 0,
+            theme: PanoramaTheme::Java.to_u8(),
             chat: ChatOptions::default(),
             force_unicode_font: false,
             japanese_glyph_variants: default_japanese_glyph_variants(),
@@ -277,30 +277,35 @@ use super::server_list::{
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PanoramaTheme {
     Pomme,
-    Default,
+    Java,
+    Bedrock,
 }
 
 impl PanoramaTheme {
     pub fn to_u8(self) -> u8 {
         match self {
             Self::Pomme => 0,
-            Self::Default => 1,
+            Self::Java => 1,
+            Self::Bedrock => 2,
         }
     }
 
     pub fn from_u8(value: u8) -> Self {
         match value {
-            1 => Self::Default,
-            _ => Self::Pomme,
+            0 => Self::Pomme,
+            2 => Self::Bedrock,
+            _ => Self::Java,
         }
     }
 
     /// The panorama cubemap each theme draws: vanilla's ships in the version
-    /// jar, Pomme's alongside the rest of the branded assets.
+    /// jar, Pomme's alongside the rest of the branded assets, Bedrock's with
+    /// its downloaded UI textures.
     pub fn panorama_dir(self, dirs: &crate::dirs::DataDirs) -> std::path::PathBuf {
         match self {
-            Self::Default => dirs.jar_assets_dir.clone(),
+            Self::Java => dirs.jar_assets_dir.clone(),
             Self::Pomme => dirs.pomme_assets_dir.join("panoramas"),
+            Self::Bedrock => dirs.bedrock_ui_dir(),
         }
     }
 }
@@ -612,6 +617,11 @@ pub struct MainMenu {
     settings_back: Screen,
     theme: PanoramaTheme,
     transition: Option<ThemeTransition>,
+    /// Where `pomme_install::bedrock` installs the Bedrock theme's files.
+    bedrock_dir: PathBuf,
+    bedrock: Arc<parking_lot::Mutex<BedrockDownload>>,
+    /// Bedrock was the last theme picked, so its download switches to it.
+    bedrock_pending: bool,
     scroll_offset: f32,
     /// Which text field of the current form has keyboard focus (index within
     /// the form). Separate from `focus` (button/widget focus ring).
@@ -723,6 +733,7 @@ const MAX_SEARCH: usize = 128;
 impl MainMenu {
     pub fn new(
         game_dir: &Path,
+        bedrock_dir: PathBuf,
         rt: Arc<tokio::runtime::Runtime>,
         username: String,
         version: String,
@@ -735,7 +746,7 @@ impl MainMenu {
         let ping_results: PingResults = Default::default();
         let settings = load_settings(game_dir);
         *key_bindings = settings.key_bindings;
-        Self {
+        let mut menu = Self {
             action_binding: None,
             username,
             version,
@@ -773,6 +784,9 @@ impl MainMenu {
             settings_back: Screen::Options,
             theme: PanoramaTheme::from_u8(settings.theme),
             transition: None,
+            bedrock_dir,
+            bedrock: Arc::new(parking_lot::Mutex::new(BedrockDownload::Idle)),
+            bedrock_pending: false,
             scroll_offset: 0.0,
             focused_field: None,
             last_field_click_time: Instant::now(),
@@ -852,7 +866,14 @@ impl MainMenu {
             reload_assets: false,
             reload_fonts: false,
             pack_search: TextFieldState::new(MAX_SEARCH),
+        };
+        // Saved on Bedrock but its files are gone: start on Default and pick
+        // Bedrock again, which downloads them and then switches.
+        if menu.theme == PanoramaTheme::Bedrock && !menu.bedrock_installed() {
+            menu.theme = PanoramaTheme::Java;
+            menu.pick_theme(PanoramaTheme::Bedrock);
         }
+        menu
     }
 
     /// Chat Settings opened from chat; leaving them leaves the menu, back to
@@ -1413,6 +1434,7 @@ fn test_menu(dir: &str, key_bindings: &mut KeyBindings) -> MainMenu {
     );
     let mut menu = MainMenu::new(
         std::path::Path::new(dir),
+        std::path::Path::new(dir).join("bedrock"),
         rt,
         "tester".into(),
         "26.2".into(),
@@ -1570,7 +1592,11 @@ mod tests {
         let legacy: Settings = serde_json::from_value(legacy).unwrap();
         assert_eq!(PanoramaTheme::from_u8(legacy.theme), PanoramaTheme::Pomme);
 
-        for theme in [PanoramaTheme::Pomme, PanoramaTheme::Default] {
+        for theme in [
+            PanoramaTheme::Pomme,
+            PanoramaTheme::Java,
+            PanoramaTheme::Bedrock,
+        ] {
             let settings = Settings {
                 theme: theme.to_u8(),
                 ..Settings::default()

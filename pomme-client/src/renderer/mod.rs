@@ -38,7 +38,7 @@ use pipelines::clouds::CloudPipeline;
 use pipelines::entity_renderer::{ArmorRenderInfo, EntityRenderInfo, EntityRenderer};
 use pipelines::entity_shadow::{EntityShadowPipeline, ShadowScene};
 use pipelines::hand::HandPipeline;
-use pipelines::menu_overlay::{MenuElement, MenuOverlayPipeline};
+use pipelines::menu_overlay::{MenuElement, MenuOverlayPipeline, SpriteId};
 use pipelines::panorama::PanoramaPipeline;
 pub use pipelines::particle::{ParticlePipeline, ParticleQuad};
 use pipelines::skin_preview::SkinPreviewPipeline;
@@ -109,7 +109,7 @@ pub(crate) fn splash_elements(sw: f32, sh: f32, progress: f32, status: &str) -> 
             y: cy - logo_size - 16.0 * gs,
             w: logo_size,
             h: logo_size,
-            sprite: pipelines::menu_overlay::SpriteId::PommeLogo,
+            sprite: SpriteId::PommeLogo,
             tint: [1.0; 4],
         },
         MenuElement::Rect {
@@ -282,6 +282,7 @@ impl Renderer {
         cache_dir: &Path,
         vsync: bool,
         panorama_dir: &Path,
+        bedrock_ui_dir: &Path,
     ) -> Result<Self, RendererError> {
         let FontSources {
             jar_assets_dir,
@@ -299,7 +300,7 @@ impl Renderer {
         };
 
         let (ctx, swapchain_state, mut frames, mut menu_pipeline) =
-            boot::bring_up(&window, font_sources, vsync)?;
+            boot::bring_up(&window, font_sources, Some(bedrock_ui_dir), vsync)?;
         // The swapchain may pick the surface's `current_extent` rather than the
         // requested size; track that actual extent so layout matches rendering.
         let swapchain_extent = swapchain_state.extent;
@@ -1179,6 +1180,20 @@ impl Renderer {
         );
         self.panorama_pipeline
             .reload_cubemap(&self.ctx.device, faces);
+    }
+
+    /// Brings the Bedrock title into the menu atlas when its files arrived
+    /// after the atlas was built.
+    pub fn load_bedrock_title(&mut self, bedrock_ui_dir: &Path) {
+        if self.menu_pipeline.has_sprite(SpriteId::BedrockTitle) {
+            return;
+        }
+        self.menu_pipeline.reload_sprite_atlas(
+            &self.ctx.device,
+            &self.jar_assets_dir,
+            &self.asset_index,
+            Some(bedrock_ui_dir),
+        );
     }
 
     pub fn trigger_skin_swing(&mut self) {

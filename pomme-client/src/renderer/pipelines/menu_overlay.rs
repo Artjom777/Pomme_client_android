@@ -64,6 +64,8 @@ pub const ICON_CHECK: char = '\u{f00c}';
 pub const ICON_USERS: char = '\u{f0c0}';
 pub const ICON_LANGUAGE: char = '\u{f1ab}';
 pub const ICON_UNIVERSAL_ACCESS: char = '\u{f29a}';
+pub const ICON_DOWNLOAD: char = '\u{f019}';
+pub const ICON_RETRY: char = '\u{f2f9}';
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -187,6 +189,8 @@ fn build_font_atlas() -> (FontAtlas, AtlasImage) {
         ICON_USERS,
         ICON_LANGUAGE,
         ICON_UNIVERSAL_ACCESS,
+        ICON_DOWNLOAD,
+        ICON_RETRY,
     ]
     .iter()
     .map(|&ch| (ch, &icon_font))
@@ -360,10 +364,17 @@ pub struct MenuGeometry {
 }
 
 impl MenuGeometry {
-    fn new(font_sources: FontSources<'_>, font_layer_limit: u32) -> (Self, MenuAtlases) {
+    fn new(
+        font_sources: FontSources<'_>,
+        bedrock_ui_dir: Option<&Path>,
+        font_layer_limit: u32,
+    ) -> (Self, MenuAtlases) {
         let (atlas, font) = build_font_atlas();
-        let (sprite_atlas, sprites) =
-            build_sprite_atlas(font_sources.jar_assets_dir, font_sources.asset_index);
+        let (sprite_atlas, sprites) = build_sprite_atlas(
+            font_sources.jar_assets_dir,
+            font_sources.asset_index,
+            bedrock_ui_dir,
+        );
         let (mc_glyph_map, glyphs) = match GlyphMap::load(font_sources, font_layer_limit) {
             Ok((map, pixels)) => (Some(map), Some(pixels)),
             Err(error) => {
@@ -1516,9 +1527,10 @@ impl MenuOverlayPipeline {
         device: &rhi::backend::Device,
         targets: rhi::backend::PipelineTargets,
         font_sources: FontSources<'_>,
+        bedrock_ui_dir: Option<&Path>,
         font_layer_limit: u32,
     ) -> Result<Self, String> {
-        let (geometry, atlases) = MenuGeometry::new(font_sources, font_layer_limit);
+        let (geometry, atlases) = MenuGeometry::new(font_sources, bedrock_ui_dir, font_layer_limit);
 
         let globals_layout =
             rhi::backend::create_bind_group_layout(device, util::VERTEX_FRAGMENT_UNIFORM);
@@ -1563,13 +1575,7 @@ impl MenuOverlayPipeline {
         };
 
         let sprite = TextureResources {
-            texture: util::create_sampled_texture(
-                device,
-                "sprite_atlas",
-                &atlases.sprites.pixels,
-                atlases.sprites.width,
-                atlases.sprites.height,
-            ),
+            texture: sprite_texture(device, &atlases.sprites),
             sampler: rhi::backend::create_sampler(device, &rhi::SamplerDesc::NEAREST),
         };
 
@@ -1833,6 +1839,28 @@ impl MenuOverlayPipeline {
             self.tex_layout,
             &texture_slot_bindings(&self.tex_slots),
         );
+    }
+
+    pub fn has_sprite(&self, id: SpriteId) -> bool {
+        self.geometry.sprite_atlas.regions.contains_key(&id)
+    }
+
+    /// Rebuilds the sprite atlas, for sprites whose files arrived after it was
+    /// built.
+    pub fn reload_sprite_atlas(
+        &mut self,
+        device: &rhi::backend::Device,
+        jar_assets_dir: &Path,
+        asset_index: &Option<AssetIndex>,
+        bedrock_ui_dir: Option<&Path>,
+    ) {
+        let (atlas, sprites) = build_sprite_atlas(jar_assets_dir, asset_index, bedrock_ui_dir);
+        device.wait_idle();
+        std::mem::replace(&mut self.sprite.texture, sprite_texture(device, &sprites))
+            .destroy(device);
+        self.geometry.sprite_atlas = atlas;
+        let (texture, sampler) = self.sprite.slot();
+        self.set_texture(device, 1, texture, sampler);
     }
 
     pub fn update_favicon_atlas(
@@ -2403,6 +2431,7 @@ pub enum SpriteId {
     PommeLogo,
     MinecraftLogo,
     MinecraftEdition,
+    BedrockTitle,
     IconFriends,
     IconLanguage,
     IconAccessibility,
@@ -2511,7 +2540,7 @@ fn rotate_verts(verts: &mut [Vertex], pivot: (f32, f32), rotation: f32) {
 /// transparent border's black stays out of the edge texels' colour. The atlas
 /// stores straight alpha and the shader premultiplies at sample time, so a
 /// naive filter would darken every anti-aliased edge twice over.
-fn downscale_straight_alpha(src: &image::RgbaImage, size: u32) -> image::RgbaImage {
+fn downscale_straight_alpha(src: &image::RgbaImage, w: u32, h: u32) -> image::RgbaImage {
     let mut premul = image::Rgba32FImage::new(src.width(), src.height());
     for (dst, src) in premul.pixels_mut().zip(src.pixels()) {
         let a = f32::from(src[3]) / 255.0;
@@ -2525,9 +2554,8 @@ fn downscale_straight_alpha(src: &image::RgbaImage, size: u32) -> image::RgbaIma
 
     // Lanczos rings and the resize clamps each channel on its own, so colour
     // can land above its own alpha; undo the premultiply against that clamp.
-    let scaled =
-        image::imageops::resize(&premul, size, size, image::imageops::FilterType::Lanczos3);
-    let mut out = image::RgbaImage::new(size, size);
+    let scaled = image::imageops::resize(&premul, w, h, image::imageops::FilterType::Lanczos3);
+    let mut out = image::RgbaImage::new(w, h);
     for (dst, src) in out.pixels_mut().zip(scaled.pixels()) {
         let a = src[3].clamp(0.0, 1.0);
         let straight = |c: f32| {
@@ -2550,6 +2578,7 @@ fn downscale_straight_alpha(src: &image::RgbaImage, size: u32) -> image::RgbaIma
 fn build_sprite_atlas(
     jar_assets_dir: &Path,
     asset_index: &Option<AssetIndex>,
+    bedrock_ui_dir: Option<&Path>,
 ) -> (SpriteAtlas, AtlasImage) {
     let sprites: &[(SpriteId, &str, f32)] = &[
         (
@@ -3846,13 +3875,33 @@ fn build_sprite_atlas(
         Ok(img) => {
             images.push((
                 SpriteId::PommeLogo,
-                downscale_straight_alpha(&img.to_rgba8(), POMME_LOGO_SIZE).into_raw(),
+                downscale_straight_alpha(&img.to_rgba8(), POMME_LOGO_SIZE, POMME_LOGO_SIZE)
+                    .into_raw(),
                 POMME_LOGO_SIZE,
                 POMME_LOGO_SIZE,
                 0.0,
             ));
         }
         Err(e) => tracing::warn!("Failed to load pomme logo: {e}"),
+    }
+
+    // The Bedrock title draws at 55% of the screen width, 1056 px at 1080p, so
+    // 1024 keeps the NEAREST sampler close to 1:1 there.
+    const BEDROCK_TITLE_W: u32 = 1024;
+    if let Some(dir) = bedrock_ui_dir {
+        match crate::assets::load_image(&dir.join("title.png")) {
+            Ok(img) => {
+                let h = (img.height() * BEDROCK_TITLE_W).div_ceil(img.width());
+                images.push((
+                    SpriteId::BedrockTitle,
+                    downscale_straight_alpha(&img.to_rgba8(), BEDROCK_TITLE_W, h).into_raw(),
+                    BEDROCK_TITLE_W,
+                    h,
+                    0.0,
+                ));
+            }
+            Err(e) => tracing::debug!("No Bedrock title yet: {e}"),
+        }
     }
 
     let sizes: Vec<(u32, u32)> = images.iter().map(|sprite| (sprite.2, sprite.3)).collect();
@@ -4080,6 +4129,16 @@ impl TextureResources {
     fn slot(&self) -> (rhi::backend::TextureHandle, rhi::backend::Sampler) {
         (self.texture.handle(), self.sampler)
     }
+}
+
+fn sprite_texture(device: &rhi::backend::Device, sprites: &AtlasImage) -> rhi::backend::Texture {
+    util::create_sampled_texture(
+        device,
+        "sprite_atlas",
+        &sprites.pixels,
+        sprites.width,
+        sprites.height,
+    )
 }
 
 fn destroy_texture_resources(device: &rhi::backend::Device, res: &mut TextureResources) {
@@ -5103,7 +5162,7 @@ mod tests {
             };
         }
 
-        let out = downscale_straight_alpha(&src, 4);
+        let out = downscale_straight_alpha(&src, 4, 4);
         assert!(out.pixels().any(|px| px[3] > 0 && px[3] < 255));
         for px in out.pixels().filter(|px| px[3] > 0) {
             assert_eq!([px[0], px[1], px[2]], [255, 255, 255], "alpha {}", px[3]);
