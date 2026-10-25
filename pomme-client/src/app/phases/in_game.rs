@@ -278,6 +278,7 @@ pub struct GameState {
     pub last_render_distance: u32,
     pub last_chat_visibility: crate::ui::chat::ChatVisibilitySetting,
     pub last_chat_colors: bool,
+    pub last_skin_options: crate::ui::menu::SkinOptions,
     pub server_render_distance: u32,
     pub server_simulation_distance: u32,
     pub item_entity_store: ItemEntityStore,
@@ -374,12 +375,14 @@ impl GameState {
         self.recent_sounds.push_back(sound.event_name().to_owned());
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         mesh_source: &impl MeshSource,
         resource_packs: Option<&ResourcePackManager>,
         render_distance: u32,
         singleplayer: bool,
         chat_options: crate::ui::chat::ChatOptions,
+        skin_options: crate::ui::menu::SkinOptions,
         block_definitions: Rc<BlockDefinitions>,
         protocol: i32,
     ) -> Self {
@@ -417,6 +420,7 @@ impl GameState {
             last_render_distance: render_distance,
             last_chat_visibility: chat_options.visibility,
             last_chat_colors: chat_options.colors,
+            last_skin_options: skin_options,
             server_render_distance: 0,
             server_simulation_distance: 0,
             item_entity_store: ItemEntityStore::new(),
@@ -1030,11 +1034,16 @@ impl GameState {
         ]);
     }
 
-    /// Whether the chat options `ClientInformation` carries differ from the
-    /// last ones sent.
-    fn chat_information_changed(&self, chat_options: crate::ui::chat::ChatOptions) -> bool {
+    /// Whether the chat or skin options `ClientInformation` carries differ
+    /// from the last ones sent.
+    fn client_options_changed(
+        &self,
+        chat_options: crate::ui::chat::ChatOptions,
+        skin_options: crate::ui::menu::SkinOptions,
+    ) -> bool {
         self.last_chat_visibility != chat_options.visibility
             || self.last_chat_colors != chat_options.colors
+            || self.last_skin_options != skin_options
     }
 
     pub fn sync_client_information(
@@ -1042,20 +1051,23 @@ impl GameState {
         connection: &ConnectionHandle,
         render_distance: u32,
         chat_options: crate::ui::chat::ChatOptions,
+        skin_options: crate::ui::menu::SkinOptions,
     ) {
         let render_changed = self.last_render_distance != render_distance;
-        let chat_changed = self.chat_information_changed(chat_options);
+        let options_changed = self.client_options_changed(chat_options, skin_options);
         self.last_render_distance = render_distance;
         self.last_chat_visibility = chat_options.visibility;
         self.last_chat_colors = chat_options.colors;
+        self.last_skin_options = skin_options;
         if render_changed {
             tracing::info!("Render distance changed to {render_distance}");
         }
-        if chat_changed {
+        if options_changed {
             tracing::info!(
                 visibility = ?chat_options.visibility,
                 colors = chat_options.colors,
-                "Chat client information changed"
+                skin = ?skin_options,
+                "Client information options changed"
             );
         }
 
@@ -1066,6 +1078,7 @@ impl GameState {
                     client_information: crate::net::client_information(
                         render_distance as u8,
                         chat_options,
+                        skin_options,
                     ),
                 },
             ));
@@ -1902,14 +1915,24 @@ fn apply_render_distance(
     rd: u32,
 ) {
     core.menu.set_bench_render_distance(rd);
-    game.sync_client_information(connection, rd, core.menu.chat_options);
+    game.sync_client_information(
+        connection,
+        rd,
+        core.menu.chat_options,
+        core.menu.skin_options(),
+    );
 }
 
 /// Puts back the render distance the chunk-load benchmark replaced, on the
 /// server too.
 fn end_chunk_load(core: &mut AppCore, game: &mut GameState, connection: &ConnectionHandle) {
     if let Some(rd) = core.menu.restore_bench_render_distance() {
-        game.sync_client_information(connection, rd, core.menu.chat_options);
+        game.sync_client_information(
+            connection,
+            rd,
+            core.menu.chat_options,
+            core.menu.skin_options(),
+        );
     }
 }
 
@@ -4275,19 +4298,23 @@ pub fn update_game(
         PauseAction::None => {}
     }
 
+    // Vanilla `Options.broadcastOptions`, which sends only what changed.
+    let (chat_options, skin_options) = (core.menu.chat_options, core.menu.skin_options());
+    if core.menu.take_options_saved()
+        && (core.menu.render_distance != game.last_render_distance
+            || game.client_options_changed(chat_options, skin_options))
+    {
+        game.sync_client_information(
+            connection,
+            core.menu.render_distance,
+            chat_options,
+            skin_options,
+        );
+    }
     if game.options_from_game {
         // TODO: a resource-pack toggle's `menu.reload_assets` is only applied
         // once back on the title screen.
         core.apply_font_options(&mut gfx.renderer);
-        if core.menu.render_distance != game.last_render_distance
-            || game.chat_information_changed(core.menu.chat_options)
-        {
-            game.sync_client_information(
-                connection,
-                core.menu.render_distance,
-                core.menu.chat_options,
-            );
-        }
         if !core.menu.is_options_screen() {
             game.options_from_game = false;
             // Chat Settings opened from chat return to it, unpaused.
