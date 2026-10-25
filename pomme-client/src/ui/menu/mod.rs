@@ -1058,6 +1058,11 @@ impl MainMenu {
         self.skin_main_hand_right
     }
 
+    pub fn set_main_hand_right(&mut self, right: bool, key_bindings: &KeyBindings) {
+        self.skin_main_hand_right = right;
+        self.save_settings(key_bindings);
+    }
+
     pub fn open_options(&mut self, key_bindings: &KeyBindings) {
         // Stale after a disconnect; the in-game path re-sets it every frame.
         self.server_render_distance = 0;

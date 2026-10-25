@@ -2346,6 +2346,8 @@ pub enum MenuElement {
 pub enum SpriteId {
     Hotbar,
     HotbarSelection,
+    HotbarOffhandLeft,
+    HotbarOffhandRight,
     HeartContainer,
     HeartFull,
     HeartHalf,
@@ -2741,6 +2743,16 @@ fn build_sprite_atlas(
         (
             SpriteId::HotbarSelection,
             "minecraft/textures/gui/sprites/hud/hotbar_selection.png",
+            0.0,
+        ),
+        (
+            SpriteId::HotbarOffhandLeft,
+            "minecraft/textures/gui/sprites/hud/hotbar_offhand_left.png",
+            0.0,
+        ),
+        (
+            SpriteId::HotbarOffhandRight,
+            "minecraft/textures/gui/sprites/hud/hotbar_offhand_right.png",
             0.0,
         ),
         (
