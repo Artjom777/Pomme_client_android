@@ -2454,6 +2454,74 @@ fn translate_merchant_offers_765() {
     assert!(p.can_restock);
 }
 
+/// An offer whose second cost 26.2 lacks is left out, not shown cheaper;
+/// the offers around it remap and keep their order.
+#[test]
+fn translate_merchant_offers_777() {
+    use pomme_protocol::{ClientRegistry, RegistryTable};
+
+    let wire_item = |name| {
+        registry_id(
+            RegistryTable::for_protocol(777).unwrap(),
+            ClientRegistry::Item,
+            name,
+        )
+    };
+    let offer = |old: &mut Vec<u8>, base: u32, second: Option<u32>| {
+        wire::write_varint(old, base);
+        old.extend_from_slice(&[2, 0]); // count, no component predicates
+        old.push(1); // result: one
+        wire::write_varint(old, wire_item("emerald"));
+        old.extend_from_slice(&[0, 0]); // no components
+        old.push(u8::from(second.is_some()));
+        if let Some(second) = second {
+            wire::write_varint(old, second);
+            old.extend_from_slice(&[1, 0]);
+        }
+        old.push(0); // out of stock
+        for n in [0i32, 12, 2, 0] {
+            old.extend_from_slice(&n.to_be_bytes()); // uses, maxUses, xp, special
+        }
+        old.extend_from_slice(&0.05f32.to_be_bytes()); // price multiplier
+        old.extend_from_slice(&0i32.to_be_bytes()); // demand
+    };
+    let mut old = Vec::new();
+    wire::write_varint(
+        &mut old,
+        old_id(777, Direction::Clientbound, "merchant_offers"),
+    );
+    wire::write_varint(&mut old, 1); // container id
+    wire::write_varint(&mut old, 3); // offers
+    offer(&mut old, wire_item("diamond"), None);
+    offer(
+        &mut old,
+        wire_item("diamond"),
+        Some(wire_item("poplar_planks")),
+    );
+    offer(&mut old, wire_item("bread"), Some(wire_item("diamond")));
+    wire::write_varint(&mut old, 2); // villager level
+    wire::write_varint(&mut old, 30); // villager xp
+    old.extend_from_slice(&[1, 1]); // show progress, can restock
+
+    let ClientboundGamePacket::MerchantOffers(p) = translate_and_decode(777, old) else {
+        panic!("wrong packet");
+    };
+    use azalea_registry::builtin::ItemKind;
+    let kept: Vec<_> = p
+        .offers
+        .iter()
+        .map(|o| (o.base_cost_a.item, o.cost_b.as_ref().map(|c| c.item)))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (ItemKind::Diamond, None),
+            (ItemKind::Bread, Some(ItemKind::Diamond))
+        ]
+    );
+    assert_eq!(p.villager_level, 2);
+}
+
 /// 1.20.5 widened `update_mob_effect`'s amplifier from a byte to a varint
 /// and dropped the trailing factor-data NBT.
 #[test]
@@ -2634,16 +2702,17 @@ fn entity_data_unmapped_item_empties_777() {
     assert_eq!(entries.len(), 2);
 }
 
-/// On the verbatim-tail fallback an unmapped item can't be skipped, so the
-/// stack empties and the list ends there.
+/// 26.3's item grammar sizes an unmapped item's components (`damage`, 5), so
+/// the stack empties and the list carries on past it.
 #[test]
-fn entity_data_unmapped_item_with_components_ends_list_777() {
+fn entity_data_unmapped_item_with_components_keeps_the_list_777() {
     let entries = entity_data_entries(777, &[8, 7, 1, 0xAC, 1, 1, 0, 3, 5, 9, 1, 7]);
     assert!(matches!(
         entity_data_stack(&entries[0]),
         azalea_inventory::ItemStack::Empty
     ));
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].index, 9);
 }
 
 /// `translate_item_765` leaves the wire item id for the typed pass, so
@@ -2693,6 +2762,53 @@ fn translate_container_set_slot_765() {
             state_id: 2,
             slot: 1,
             item: pomme_stack(azalea_registry::builtin::ItemKind::Stone, 2)
+        }
+    );
+}
+
+/// 26.3's item and component ids shift past 26.2's; a slot holding a dyed
+/// diamond lands in native ids, decoded by pomme's own container reader.
+#[test]
+fn translate_container_set_slot_777() {
+    use pomme_protocol::{ClientRegistry, RegistryTable};
+
+    let wire_table = RegistryTable::for_protocol(777).unwrap();
+    let native_table = RegistryTable::native();
+    let mut old = Vec::new();
+    wire::write_varint(
+        &mut old,
+        old_id(777, Direction::Clientbound, "container_set_slot"),
+    );
+    old.extend_from_slice(&[0, 4]); // container, state id
+    old.extend_from_slice(&36i16.to_be_bytes());
+    old.push(1); // count
+    wire::write_varint(
+        &mut old,
+        registry_id(wire_table, ClientRegistry::Item, "diamond"),
+    );
+    old.extend_from_slice(&[1, 0]); // one added, none removed
+    wire::write_varint(
+        &mut old,
+        registry_id(wire_table, ClientRegistry::DataComponentType, "dyed_color"),
+    );
+    old.extend_from_slice(&0x123456i32.to_be_bytes());
+
+    let mut item = pomme_stack(azalea_registry::builtin::ItemKind::Diamond, 1).unwrap();
+    item.patch.added.push((
+        registry_id(
+            native_table,
+            ClientRegistry::DataComponentType,
+            "dyed_color",
+        ),
+        0x123456i32.to_be_bytes().into(),
+    ));
+    assert_eq!(
+        translate_and_read(777, old, "container_set_slot", container::read),
+        ContainerPacket::Slot {
+            container_id: 0,
+            state_id: 4,
+            slot: 36,
+            item: Some(item)
         }
     );
 }
@@ -4771,8 +4887,8 @@ fn translate_player_chat_777() {
 }
 
 /// A 26.3 component whose value layout changed (`pot_decorations` became
-/// four optional item templates) can't be sized with 26.2's codec, so the
-/// particle carrying it drops rather than misparsing.
+/// four optional item templates) is sized by 26.3's item grammar, so the
+/// particle carrying it still arrives.
 #[test]
 fn translate_changed_component_777() {
     use pomme_protocol::{ClientRegistry, RegistryTable};
@@ -4801,10 +4917,11 @@ fn translate_changed_component_777() {
     write_doubles(&mut old, [1.0, 65.0, -2.0]);
     write_floats(&mut old, [0.0; 6]);
     old.extend_from_slice(&[1, 0]); // count, randomization
+    // Pomme reads only the particle's type, so its payload passes through.
     assert!(
         translation_for(777)
             .translate_game_frame(old.into_boxed_slice())
-            .is_none()
+            .is_some()
     );
 }
 
@@ -5304,7 +5421,7 @@ fn sample_component(
         }
         Struct(fields) => fields.iter().for_each(|f| deeper(f, out)),
         Ref(inner) => deeper(inner, out),
-        Holder(direct) => {
+        Holder(direct) | RegistryHolder(_, direct) => {
             if inline {
                 out.push(0);
                 deeper(direct, out);
@@ -5312,6 +5429,7 @@ fn sample_component(
                 out.push(2);
             }
         }
+        RegistryId(_) => out.push(1),
         HolderSet => out.extend([2, 1]),
         ById(arms) => {
             out.push(arms.len() as u8 - 1);
