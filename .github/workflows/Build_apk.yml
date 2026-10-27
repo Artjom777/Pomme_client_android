@@ -1,1 +1,24 @@
-
+name: Build Rust Android APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        run: |
+          rustup target add aarch64-linux-android
+      - name: Setup Java & NDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Build APK
+        run: |
+          cd pomme-android || cd android || ./gradlew assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Minecraft-Rust-APK
+          path: "**/build/outputs/apk/debug/*.apk"
+          
