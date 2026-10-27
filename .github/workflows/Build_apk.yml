@@ -420,6 +420,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+      - name: Set Release Tag
+        id: vars
+        run: |
+          echo "tag=nightly-$(date +'%Y%m%d%H%M')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date +'%Y-%m-%d %H:%M')" >> "$GITHUB_OUTPUT"
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
@@ -427,12 +433,13 @@ jobs:
           pattern: release-*
           path: release-assets
           merge-multiple: true
-      - name: Publish GitHub Release
+      - name: Publish Automated GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly
-          name: "Nightly Build"
-          prerelease: true
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: "Automated Build (${{ steps.vars.outputs.date }})"
+          prerelease: false
+          make_latest: true
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
