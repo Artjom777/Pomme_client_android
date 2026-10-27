@@ -59,22 +59,92 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: android
-      - name: Add the Android target
-        run: rustup target add aarch64-linux-android
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk@4.1.2 --locked
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Add Android Targets
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cargo install cargo-ndk@4.1.2 --locked
       - name: Clippy
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a clippy -p pomme-android -- -D warnings
-      - name: Build Android Release
+      - name: Build Android Binaries (v8a, v7a 32bit, v9.2a poco x7 pro)
         run: |
+          mkdir -p libs/arm64-v8a libs/armeabi-v7a libs/arm64-v92a artifacts
           ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a build -p pomme-android --release
-          mkdir -p artifacts
-          cp target/aarch64-linux-android/release/libpomme_android.so artifacts/ || cp target/aarch64-linux-android/release/*.so artifacts/ || true
-      - name: Upload Android Artifact
+          cp target/aarch64-linux-android/release/libpomme_android.so libs/arm64-v8a/
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t armeabi-v7a build -p pomme-android --release
+          cp target/armv7-linux-androideabi/release/libpomme_android.so libs/armeabi-v7a/
+          RUSTFLAGS="-C target-cpu=neoverse-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+sve,+sve2,+neon,+fp16" \
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a build -p pomme-android --release --target-dir target_v92a
+          cp target_v92a/aarch64-linux-android/release/libpomme_android.so libs/arm64-v92a/
+      - name: Package Standalone APKs
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          PLATFORM="$ANDROID_HOME/platforms/android-34/android.jar"
+          keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=AndroidDebug,O=Android,C=US"
+          package_apk() {
+            local arch_folder=$1
+            local out_name=$2
+            local workdir="apk_build_${out_name}"
+            mkdir -p "$workdir/lib/$arch_folder" "$workdir/res/values"
+            cp "$3" "$workdir/lib/$arch_folder/libpomme_android.so"
+            cat << 'EOF' > "$workdir/res/values/strings.xml"
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Pomme</string>
+          </resources>
+          EOF
+            cat << 'EOF' > "$workdir/AndroidManifest.xml"
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="org.pomme.app"
+              android:versionCode="1"
+              android:versionName="1.0">
+              <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+              <uses-feature android:glEsVersion="0x00030002" android:required="true" />
+              <uses-feature android:name="android.hardware.vulkan.level" android:version="1" android:required="true" />
+              <application android:label="@string/app_name" android:hasCode="false" android:extractNativeLibs="true">
+                  <activity android:name="android.app.NativeActivity"
+                      android:label="@string/app_name"
+                      android:configChanges="orientation|keyboardHidden|screenSize"
+                      android:exported="true">
+                      <meta-data android:name="android.app.lib_name" android:value="pomme_android" />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+            "$BUILD_TOOLS/aapt2" compile --dir "$workdir/res" -o "$workdir/compiled_res.zip"
+            "$BUILD_TOOLS/aapt2" link "$workdir/compiled_res.zip" -I "$PLATFORM" --manifest "$workdir/AndroidManifest.xml" -o "$workdir/unaligned.apk"
+            cd "$workdir" && zip -u -r unaligned.apk "lib/$arch_folder/libpomme_android.so" && cd ..
+            "$BUILD_TOOLS/zipalign" -v -p 4 "$workdir/unaligned.apk" "artifacts/${out_name}.apk"
+            "$BUILD_TOOLS/apksigner" sign --ks debug.keystore --ks-pass pass:android --ks-key-alias androiddebugkey "artifacts/${out_name}.apk"
+          }
+          if [ -f "./android/gradlew" ]; then
+            mkdir -p android/app/src/main/jniLibs/arm64-v8a android/app/src/main/jniLibs/armeabi-v7a
+            cp libs/arm64-v8a/libpomme_android.so android/app/src/main/jniLibs/arm64-v8a/
+            cp libs/armeabi-v7a/libpomme_android.so android/app/src/main/jniLibs/armeabi-v7a/
+            cd android && chmod +x gradlew && ./gradlew assembleRelease && cd ..
+            find android -name "*.apk" -type f -exec cp {} artifacts/pomme-android-armv8a.apk \;
+            cp libs/arm64-v92a/libpomme_android.so android/app/src/main/jniLibs/arm64-v8a/
+            cd android && ./gradlew assembleRelease && cd ..
+            find android -name "*.apk" -type f -exec cp {} artifacts/pomme-android-armv9.2a-pocox7pro.apk \;
+          else
+            package_apk "arm64-v8a" "pomme-android-armv8a" "libs/arm64-v8a/libpomme_android.so"
+            package_apk "armeabi-v7a" "pomme-android-armeabi-v7a-32bit" "libs/armeabi-v7a/libpomme_android.so"
+            package_apk "arm64-v8a" "pomme-android-armv9.2a-pocox7pro" "libs/arm64-v92a/libpomme_android.so"
+          fi
+      - name: Upload Android Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pomme-android-arm64
-          path: artifacts/*
+          name: release-android
+          path: artifacts/*.apk
   ios:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -86,7 +156,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: ios
-      - name: Add the iOS target
+      - name: Add iOS Target
         run: rustup target add aarch64-apple-ios
       - uses: actions/cache@v4
         with:
@@ -94,16 +164,49 @@ jobs:
           key: moltenvk-${{ hashFiles('tools/fetch_moltenvk.py') }}
       - name: Clippy
         run: SHADERC_LIB_DIR="$VULKAN_SDK/lib" VULKAN_SDK="$(python3 tools/fetch_moltenvk.py ios)" cargo clippy -p pomme-ios --target aarch64-apple-ios -- -D warnings
-      - name: Build iOS Release
+      - name: Package iOS IPA
         run: |
+          mkdir -p artifacts Payload/Pomme.app
           SHADERC_LIB_DIR="$VULKAN_SDK/lib" VULKAN_SDK="$(python3 tools/fetch_moltenvk.py ios)" cargo build -p pomme-ios --target aarch64-apple-ios --release
-          mkdir -p artifacts
-          cp target/aarch64-apple-ios/release/*.a artifacts/ || cp target/aarch64-apple-ios/release/*.dylib artifacts/ || true
+          if [ -f "target/aarch64-apple-ios/release/pomme-ios" ]; then
+            cp target/aarch64-apple-ios/release/pomme-ios Payload/Pomme.app/Pomme
+          else
+            cp target/aarch64-apple-ios/release/*.dylib Payload/Pomme.app/ 2>/dev/null || true
+            cp target/aarch64-apple-ios/release/*.a Payload/Pomme.app/ 2>/dev/null || true
+          fi
+          cat << 'EOF' > Payload/Pomme.app/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>Pomme</string>
+              <key>CFBundleIdentifier</key>
+              <string>org.pomme.ios</string>
+              <key>CFBundleName</key>
+              <string>Pomme</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>UIRequiredDeviceCapabilities</key>
+              <array>
+                  <string>arm64</string>
+                  <string>metal</string>
+              </array>
+          </dict>
+          </plist>
+          EOF
+          zip -r artifacts/pomme-ios-arm64.ipa Payload
       - name: Upload iOS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pomme-ios-arm64
-          path: artifacts/*
+          name: release-ios
+          path: artifacts/*.ipa
   fmt:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -157,10 +260,10 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: singleplayer
-      - name: Pin the steel revision
+      - name: Pin Steel Revision
         id: steel
         run: echo "rev=$(git -C third_party/SteelMC rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Cache the generated steel source
+      - name: Cache Generated Steel Source
         uses: actions/cache@v6
         with:
           path: |
@@ -172,21 +275,21 @@ jobs:
             third_party/SteelMC/steel-worldgen/src/generated
           key: steel-generated-${{ steps.steel.outputs.rev }}
       - run: just ci-singleplayer
-      - name: Build SteelMC Release
+      - name: Build SteelMC Binary
         run: |
-          cargo build --release -p steel-core || cargo build --release || true
           mkdir -p artifacts
-          find target/release -maxdepth 1 -type f -executable -exec cp {} artifacts/steel-singleplayer-linux \; || true
+          cargo build --release -p steel-core || cargo build --release || true
+          find target/release -maxdepth 1 -type f -executable -exec cp {} artifacts/steel-core-linux-x86_64 \; || true
       - name: Upload SteelMC Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: steel-singleplayer-linux
+          name: release-steelmc-linux
           path: artifacts/*
   pr-template:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check PR template and labeler agree
+      - name: Check PR Template
         run: |
           python3 - <<'PY'
           import pathlib, re, sys
@@ -221,20 +324,29 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - name: Install dependencies
+      - name: Install Dependencies
         run: pnpm install
-      - name: Format check
+      - name: Format Check
         run: pnpm --filter pomme-launcher format:check
       - name: Lint
         run: pnpm --filter pomme-launcher lint
-      - name: Type check
+      - name: Type Check
         run: pnpm --filter pomme-launcher exec tsc --noEmit
   launcher:
     needs: changes
     if: needs.changes.outputs.launcher == 'true'
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact_name: pomme-launcher-windows-x86_64.exe
+            src_binary: target/release/pomme-launcher.exe
+          - os: ubuntu-latest
+            artifact_name: pomme-launcher-linux-x86_64
+            src_binary: target/release/pomme-launcher
+          - os: macos-latest
+            artifact_name: pomme-launcher-macos
+            src_binary: target/release/pomme-launcher
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -247,17 +359,17 @@ jobs:
         with:
           shared-key: launcher
           cache-on-failure: true
-      - name: Install Linux dependencies
+      - name: Install Linux Dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - name: Format check
+      - name: Format Check
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt -p pomme-launcher -- --check
       - name: Clippy
         run: cargo clippy -p pomme-launcher --release --all-targets --all-features -- -D warnings
-      - name: Check bindings are up to date
+      - name: Check Bindings Up To Date
         if: matrix.os == 'ubuntu-latest'
         run: |
           cargo run -p pomme-launcher --quiet --bin generate-bindings
@@ -265,23 +377,17 @@ jobs:
             echo "::error::pomme-launcher/src/bindings is stale. Run 'cargo run -p pomme-launcher --bin generate-bindings' and commit."
             exit 1
           fi
-      - name: Build Launcher Release Binary
+      - name: Build Launcher Executable
         run: cargo build -p pomme-launcher --release
-      - name: Prepare build artifact (Linux/macOS)
-        if: matrix.os != 'windows-latest'
-        run: |
-          mkdir -p artifacts
-          cp target/release/pomme-launcher artifacts/pomme-launcher-${{ matrix.os }}
-      - name: Prepare build artifact (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Prepare Artifact
         shell: bash
         run: |
           mkdir -p artifacts
-          cp target/release/pomme-launcher.exe artifacts/pomme-launcher-windows.exe
-      - name: Upload artifacts
+          cp ${{ matrix.src_binary }} artifacts/${{ matrix.artifact_name }}
+      - name: Upload Launcher Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: launcher-${{ matrix.os }}
+          name: release-${{ matrix.os }}
           path: artifacts/*
   ci:
     if: always()
@@ -307,9 +413,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all built artifacts
+      - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: release-assets
           merge-multiple: true
       - name: Publish GitHub Release
