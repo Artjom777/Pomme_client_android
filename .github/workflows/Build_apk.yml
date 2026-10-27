@@ -30,7 +30,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Android Targets & NDK Tool
+      - name: Add Android Targets
         run: |
           rustup target add aarch64-linux-android armv7-linux-androideabi
           cargo install cargo-ndk@4.1.2 --locked
@@ -38,36 +38,37 @@ jobs:
       - name: Build Standard ARM64 APK (arm64-v8a)
         run: |
           mkdir -p pomme-android/app/src/main/jniLibs/arm64-v8a
-          cargo ndk -t arm64-v8a build -p pomme-android --release
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a build -p pomme-android --release
           cp target/aarch64-linux-android/release/libpomme_android.so pomme-android/app/src/main/jniLibs/arm64-v8a/
           cd pomme-android
           chmod +x gradlew
-          ./gradlew assembleRelease
+          ./gradlew assembleDebug
           cd ..
           mkdir -p artifacts
-          cp pomme-android/app/build/outputs/apk/release/*.apk artifacts/pomme-android-arm64-v8a.apk
+          cp $(find pomme-android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1) artifacts/pomme-client-arm64-v8a.apk
 
       - name: Build 32-bit APK (armeabi-v7a)
         run: |
           rm -rf pomme-android/app/src/main/jniLibs/*
           mkdir -p pomme-android/app/src/main/jniLibs/armeabi-v7a
-          cargo ndk -t armeabi-v7a build -p pomme-android --release
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t armeabi-v7a build -p pomme-android --release
           cp target/armv7-linux-androideabi/release/libpomme_android.so pomme-android/app/src/main/jniLibs/armeabi-v7a/
           cd pomme-android
-          ./gradlew assembleRelease
+          ./gradlew clean assembleDebug
           cd ..
-          cp pomme-android/app/build/outputs/apk/release/*.apk artifacts/pomme-android-armeabi-v7a-32bit.apk
+          cp $(find pomme-android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1) artifacts/pomme-client-armeabi-v7a-32bit.apk
 
       - name: Build Optimized APK for POCO X7 Pro (ARMv9.2-A / Cortex-A725)
         run: |
           rm -rf pomme-android/app/src/main/jniLibs/*
           mkdir -p pomme-android/app/src/main/jniLibs/arm64-v8a
-          RUSTFLAGS="-C target-cpu=neoverse-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+sve,+sve2,+neon,+fp16" cargo ndk -t arm64-v8a build -p pomme-android --release --target-dir target_v92a
+          RUSTFLAGS="-C target-cpu=neoverse-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+sve,+sve2,+neon,+fp16" \
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a build -p pomme-android --release --target-dir target_v92a
           cp target_v92a/aarch64-linux-android/release/libpomme_android.so pomme-android/app/src/main/jniLibs/arm64-v8a/
           cd pomme-android
-          ./gradlew assembleRelease
+          ./gradlew clean assembleDebug
           cd ..
-          cp pomme-android/app/build/outputs/apk/release/*.apk artifacts/pomme-android-pocox7pro-armv9.2a.apk
+          cp $(find pomme-android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1) artifacts/pomme-client-pocox7pro-armv9.2a.apk
 
       - name: Upload Android Artifacts
         uses: actions/upload-artifact@v4
@@ -105,7 +106,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libudev-dev
 
-      - name: Build Client
+      - name: Build Client Binary
         run: cargo build -p pomme-client --release
 
       - name: Prepare Artifact
@@ -148,7 +149,7 @@ jobs:
         with:
           node-version: 22
 
-      - name: Build Web UI
+      - name: Build UI Dist
         run: |
           pnpm install
           pnpm --filter pomme-launcher build
@@ -199,12 +200,10 @@ jobs:
         run: |
           mkdir -p artifacts
           chmod +x pomme-ios/build-app.sh
-          ./pomme-ios/build-app.sh || true
-          if [ -d "pomme-ios/build/Build/Products/Release-iphoneos/Pomme.app" ]; then
-            mkdir -p Payload
-            cp -r pomme-ios/build/Build/Products/Release-iphoneos/Pomme.app Payload/
-            zip -r artifacts/pomme-ios.ipa Payload
-          fi
+          ./pomme-ios/build-app.sh
+          mkdir -p Payload
+          cp -r pomme-ios/build/Build/Products/Release-iphoneos/Pomme.app Payload/
+          zip -r artifacts/pomme-ios.ipa Payload
 
       - name: Upload iOS Artifact
         uses: actions/upload-artifact@v4
@@ -213,7 +212,7 @@ jobs:
           path: artifacts/*.ipa
 
   release:
-    if: always() && github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request'
     needs: [android, desktop-client, launcher, ios]
     runs-on: ubuntu-latest
     permissions:
@@ -234,7 +233,7 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Publish Automated GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
