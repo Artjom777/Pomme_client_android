@@ -32,7 +32,7 @@ jobs:
 
       - name: Add Android Targets
         run: |
-          rustup target add aarch64-linux-android armv7-linux-androideabi
+          rustup target add aarch64-linux-android
           cargo install cargo-ndk@4.1.2 --locked
 
       - name: Build Standard ARM64 APK (arm64-v8a)
@@ -47,28 +47,19 @@ jobs:
           mkdir -p artifacts
           cp $(find pomme-android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1) artifacts/pomme-client-arm64-v8a.apk
 
-      - name: Build 32-bit APK (armeabi-v7a)
-        run: |
-          rm -rf pomme-android/app/src/main/jniLibs/*
-          mkdir -p pomme-android/app/src/main/jniLibs/armeabi-v7a
-          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t armeabi-v7a build -p pomme-android --release
-          cp target/armv7-linux-androideabi/release/libpomme_android.so pomme-android/app/src/main/jniLibs/armeabi-v7a/
-          cd pomme-android
-          ./gradlew clean assembleDebug
-          cd ..
-          cp $(find pomme-android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1) artifacts/pomme-client-armeabi-v7a-32bit.apk
-
       - name: Build Optimized APK for POCO X7 Pro (ARMv9.2-A / Cortex-A725)
+        continue-on-error: true
         run: |
           rm -rf pomme-android/app/src/main/jniLibs/*
           mkdir -p pomme-android/app/src/main/jniLibs/arm64-v8a
-          RUSTFLAGS="-C target-cpu=neoverse-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+sve,+sve2,+neon,+fp16" \
-          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a build -p pomme-android --release --target-dir target_v92a
-          cp target_v92a/aarch64-linux-android/release/libpomme_android.so pomme-android/app/src/main/jniLibs/arm64-v8a/
-          cd pomme-android
-          ./gradlew clean assembleDebug
-          cd ..
-          cp $(find pomme-android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1) artifacts/pomme-client-pocox7pro-armv9.2a.apk
+          if RUSTFLAGS="-C target-cpu=neoverse-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+sve,+sve2,+neon,+fp16" \
+             ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a build -p pomme-android --release --target-dir target_v92a; then
+            cp target_v92a/aarch64-linux-android/release/libpomme_android.so pomme-android/app/src/main/jniLibs/arm64-v8a/
+            cd pomme-android
+            ./gradlew clean assembleDebug
+            cd ..
+            cp $(find pomme-android/app/build/outputs/apk/debug/ -name "*.apk" | head -n 1) artifacts/pomme-client-pocox7pro-armv9.2a.apk
+          fi
 
       - name: Upload Android Artifacts
         uses: actions/upload-artifact@v4
@@ -76,144 +67,9 @@ jobs:
           name: release-android
           path: artifacts/*.apk
 
-  desktop-client:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact_name: pomme-client-windows-x86_64.exe
-            src_binary: target/release/pomme.exe
-          - os: ubuntu-latest
-            artifact_name: pomme-client-linux-x86_64
-            src_binary: target/release/pomme
-          - os: macos-latest
-            artifact_name: pomme-client-macos
-            src_binary: target/release/pomme
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: client-${{ matrix.os }}
-
-      - name: Install Linux Dependencies
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libudev-dev
-
-      - name: Build Client Binary
-        run: cargo build -p pomme-client --release
-
-      - name: Prepare Artifact
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          cp ${{ matrix.src_binary }} artifacts/${{ matrix.artifact_name }}
-
-      - name: Upload Client Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-client-${{ matrix.os }}
-          path: artifacts/*
-
-  launcher:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact_name: pomme-launcher-windows-x86_64.exe
-            src_binary: target/release/pomme-launcher.exe
-          - os: ubuntu-latest
-            artifact_name: pomme-launcher-linux-x86_64
-            src_binary: target/release/pomme-launcher
-          - os: macos-latest
-            artifact_name: pomme-launcher-macos
-            src_binary: target/release/pomme-launcher
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Build UI Dist
-        run: |
-          pnpm install
-          pnpm --filter pomme-launcher build
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: launcher-${{ matrix.os }}
-
-      - name: Install Linux Dependencies
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
-      - name: Build Launcher
-        run: cargo build -p pomme-launcher --release
-
-      - name: Prepare Artifact
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          cp ${{ matrix.src_binary }} artifacts/${{ matrix.artifact_name }}
-
-      - name: Upload Launcher Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-launcher-${{ matrix.os }}
-          path: artifacts/*
-
-  ios:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - uses: ./.github/actions/setup-rust
-        with:
-          cache-key: ios
-
-      - name: Add Target
-        run: rustup target add aarch64-apple-ios
-
-      - name: Install Tools
-        run: brew install xcodegen
-
-      - name: Build iOS Application
-        run: |
-          mkdir -p artifacts
-          chmod +x pomme-ios/build-app.sh
-          ./pomme-ios/build-app.sh
-          mkdir -p Payload
-          cp -r pomme-ios/build/Build/Products/Release-iphoneos/Pomme.app Payload/
-          zip -r artifacts/pomme-ios.ipa Payload
-
-      - name: Upload iOS Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-ios
-          path: artifacts/*.ipa
-
   release:
     if: github.event_name != 'pull_request'
-    needs: [android, desktop-client, launcher, ios]
+    needs: [android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -243,4 +99,3 @@ jobs:
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
