@@ -52,7 +52,7 @@ jobs:
         run: |
           rm -rf pomme-android/app/src/main/jniLibs/*
           mkdir -p pomme-android/app/src/main/jniLibs/arm64-v8a
-          if RUSTFLAGS="-C target-cpu=neoverse-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+sve,+sve2,+neon,+fp16" \
+          if RUSTFLAGS="-C target-cpu=neoverse-v2 -C opt-level=3 -C codegen-units=1 -C target-feature=+sve,+sve2,+neon,+fp16" \
              ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a build -p pomme-android --release --target-dir target_v92a; then
             cp target_v92a/aarch64-linux-android/release/libpomme_android.so pomme-android/app/src/main/jniLibs/arm64-v8a/
             cd pomme-android
